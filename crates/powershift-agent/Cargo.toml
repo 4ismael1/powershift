@@ -1,0 +1,15 @@
+[package]
+name = "powershift-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+powershift-core = { path = "../powershift-core" }
+powershift-windows = { path = "../powershift-windows" }
+getrandom = "0.2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "powershift-agent"
+path = "src/main.rs"

@@ -1,0 +1,35 @@
+{
+  "name": "powershift",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "npm run build:frontend && npm run build:agent:release && npm run build:tray:release",
+    "build:frontend": "vue-tsc --noEmit && vite build",
+    "build:agent:debug": "cargo build -p powershift-agent",
+    "build:agent:release": "cargo build -p powershift-agent --release",
+    "build:tray:debug": "cargo build -p powershift-tray",
+    "build:tray:release": "cargo build -p powershift-tray --release",
+    "test": "vitest run",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "tauri:before-dev": "npm run build:agent:release && npm run build:tray:release && npm run dev",
+    "tauri:before-build": "npm run build",
+    "tauri:dev": "tauri dev"
+  },
+  "dependencies": {
+    "@lucide/vue": "^1.23.0",
+    "@tauri-apps/api": "^2.8.0",
+    "@tauri-apps/plugin-dialog": "^2.7.1",
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.8.4",
+    "@vitejs/plugin-vue": "^5.2.1",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3",
+    "vitest": "^4.1.9",
+    "vue-tsc": "^2.1.10"
+  }
+}

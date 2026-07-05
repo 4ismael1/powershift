@@ -1,0 +1,28 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+src-tauri/gen/
+.agents/
+.codex/
+
+# Local logs and debug output
+*.log
+*.tmp
+
+# Release artifacts belong in GitHub Releases, not in git history.
+release-artifacts/
+*.exe
+*.msi
+*.msix
+*.appx
+*.pdb
+*.sig
+*.zip
+
+# Local-only screenshots or generated previews.
+powershift-preview.png
+
+# Internal planning/audit notes; keep public docs focused on users/devs.
+docs/PLAN_DESARROLLO.md
+docs/POWERSHIFT_DEEP_DIVE.md
