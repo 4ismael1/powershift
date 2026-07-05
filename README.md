@@ -60,6 +60,41 @@ The UI is intentionally not the resident worker. When the window is closed or
 hidden, the agent and tray keep the automation alive without keeping the WebView
 open.
 
+## Resource Usage
+
+PowerShift is designed around a simple rule: the background path must stay tiny,
+and the heavier interface should only exist while the user is configuring the
+app.
+
+In normal use, the resident background footprint is only the Rust agent plus the
+tray helper. The Tauri/WebView UI is temporary; closing the window removes the
+interface from the steady-state workload.
+
+Preview measurement for `v0.1.0-preview` on a Windows desktop while idle with
+the UI closed:
+
+| Mode | Running components | CPU while idle | Working set |
+| --- | --- | --- | --- |
+| Background mode | `powershift-agent.exe` + `powershift-tray.exe` | ~0.80 CPU seconds over 5 minutes | ~13.9 MB average, ~14.5 MB max |
+| Agent only | `powershift-agent.exe` | ~0.78 CPU seconds over 5 minutes | ~4.3 MB average, ~4.9 MB max |
+| Tray only | `powershift-tray.exe` | ~0.02 CPU seconds over 5 minutes | ~9.6 MB average, ~9.7 MB max |
+| UI open | Background components + `powershift.exe` WebView | Higher, temporary | Medium, temporary |
+
+```mermaid
+xychart-beta
+  title "Idle resident memory, UI closed (5 min preview sample)"
+  x-axis ["Agent", "Tray", "Combined"]
+  y-axis "Working set (MB)" 0 --> 16
+  bar [4.3, 9.6, 13.9]
+```
+
+The important behavior is not that the configuration UI uses no memory. It is
+that the UI is not the automation engine. Most of the time PowerShift should be
+closed to the tray, leaving the low-resource Rust background components active.
+These numbers describe the current preview build, not a final ceiling; continued
+optimization of the agent, tray, and process tracking model is part of the
+project roadmap.
+
 ## Detection Model
 
 PowerShift is event-driven. It does not continuously poll the process list in a
