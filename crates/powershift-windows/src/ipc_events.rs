@@ -4,6 +4,7 @@ pub const UI_SHOW_EVENT_NAME: &str = "Local\\PowerShiftUiShow";
 pub const UI_EXIT_EVENT_NAME: &str = "Local\\PowerShiftUiExit";
 pub const TRAY_QUIT_EVENT_NAME: &str = "Local\\PowerShiftTrayQuit";
 pub const EVENT_LOG_UPDATED_EVENT_NAME: &str = "Local\\PowerShiftEventLogUpdated";
+pub const AGENT_STATE_UPDATED_EVENT_NAME: &str = "Local\\PowerShiftAgentStateUpdated";
 
 #[cfg(windows)]
 pub type EventHandle = windows::Win32::Foundation::HANDLE;
@@ -77,5 +78,6 @@ mod tests {
         assert!(UI_EXIT_EVENT_NAME.starts_with("Local\\"));
         assert!(TRAY_QUIT_EVENT_NAME.starts_with("Local\\"));
         assert!(EVENT_LOG_UPDATED_EVENT_NAME.starts_with("Local\\"));
+        assert!(AGENT_STATE_UPDATED_EVENT_NAME.starts_with("Local\\"));
     }
 }

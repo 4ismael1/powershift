@@ -1,12 +1,14 @@
 pub mod autostart;
 pub mod error;
 pub mod icon;
+pub mod identity;
 pub mod ipc_events;
 pub mod manager;
 pub mod named_pipe;
 pub mod powercfg;
 pub mod process;
 pub mod process_events;
+pub mod runtime_paths;
 pub mod single_instance;
 pub mod wake;
 pub mod window_events;
@@ -20,9 +22,10 @@ pub use autostart::{
 };
 pub use error::{PowerError, PowerResult};
 pub use icon::{png_data_url, png_data_url_from_executable};
+pub use identity::current_user_sid_string;
 pub use ipc_events::{
-    create_ipc_event, signal_ipc_event, wait_for_ipc_event, EVENT_LOG_UPDATED_EVENT_NAME,
-    TRAY_QUIT_EVENT_NAME, UI_EXIT_EVENT_NAME, UI_SHOW_EVENT_NAME,
+    create_ipc_event, signal_ipc_event, wait_for_ipc_event, AGENT_STATE_UPDATED_EVENT_NAME,
+    EVENT_LOG_UPDATED_EVENT_NAME, TRAY_QUIT_EVENT_NAME, UI_EXIT_EVENT_NAME, UI_SHOW_EVENT_NAME,
 };
 pub use manager::{PowerManager, PowerManagerBackend};
 pub use named_pipe::{
@@ -37,6 +40,7 @@ pub use process_events::{
     spawn_process_event_watchers, ProcessEvent, ProcessEventKind, ProcessWatchMessage,
     ProcessWatcherKind,
 };
+pub use runtime_paths::PowerShiftPaths;
 pub use single_instance::{
     try_acquire_single_instance, SingleInstanceGuard, AGENT_INSTANCE_MUTEX_NAME,
     TRAY_INSTANCE_MUTEX_NAME, UI_INSTANCE_MUTEX_NAME,

@@ -270,6 +270,29 @@ describe('agentApi', () => {
     expect(agentStateTone({ ...state, status: 'running', updated_at_ms: 200 }, true, 200)).toBe('ready');
   });
 
+  it('surfaces degraded WMI watchers even while the agent is alive', () => {
+    const state = {
+      pid: 42,
+      status: 'running' as const,
+      updated_at_ms: 200,
+      process_alive: true,
+      last_error: null,
+      last_scan: null,
+      wmi_watchers: {
+        starts: { state: 'running' as const, last_transition_ms: 100 },
+        stops: {
+          state: 'degraded' as const,
+          last_transition_ms: 150,
+          retry_in_ms: 1000,
+          last_error: 'WMI unavailable',
+        },
+      },
+    };
+
+    expect(describeAgentState(state, true, 200)).toContain('WMI degradados');
+    expect(agentStateTone(state, true, 200)).toBe('warning');
+  });
+
   it('only auto-installs the elevated agent inside Tauri when agent automation is enabled and task is missing', () => {
     expect(shouldAutoInstallElevatedAgent(true, false, true)).toBe(false);
     expect(shouldAutoInstallElevatedAgent(false, false, true)).toBe(false);

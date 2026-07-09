@@ -1,8 +1,7 @@
 use crate::PowerResult;
 
 pub const AGENT_WAKE_EVENT_NAME: &str = "Local\\PowerShiftAgentWake";
-pub const AGENT_WAKE_EVENT_SDDL: &str =
-    "D:P(A;;0x00100002;;;SY)(A;;0x00100002;;;BA)(A;;0x00100002;;;IU)";
+const AGENT_WAKE_EVENT_SDDL_PREFIX: &str = "D:P(A;;0x00100002;;;SY)(A;;0x00100002;;;BA)";
 
 #[cfg(windows)]
 pub fn create_agent_wake_event() -> PowerResult<windows::Win32::Foundation::HANDLE> {
@@ -51,10 +50,11 @@ fn wake_event_security_attributes() -> PowerResult<(
     };
     use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
+    let sddl = wake_event_security_descriptor()?;
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            &HSTRING::from(AGENT_WAKE_EVENT_SDDL),
+            &HSTRING::from(sddl),
             SDDL_REVISION_1,
             &mut descriptor,
             None,
@@ -69,6 +69,14 @@ fn wake_event_security_attributes() -> PowerResult<(
     };
 
     Ok((LocalSecurityDescriptor(descriptor), attributes))
+}
+
+#[cfg(windows)]
+fn wake_event_security_descriptor() -> PowerResult<String> {
+    Ok(format!(
+        "{AGENT_WAKE_EVENT_SDDL_PREFIX}(A;;0x00100002;;;{})",
+        crate::current_user_sid_string()?
+    ))
 }
 
 #[cfg(windows)]
@@ -122,11 +130,16 @@ mod tests {
         assert!(AGENT_WAKE_EVENT_NAME.starts_with("Local\\"));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn wake_event_sddl_allows_interactive_ui_to_signal_elevated_agent() {
-        assert!(AGENT_WAKE_EVENT_SDDL.contains("0x00100002"));
-        assert!(AGENT_WAKE_EVENT_SDDL.contains(";;;SY"));
-        assert!(AGENT_WAKE_EVENT_SDDL.contains(";;;BA"));
-        assert!(AGENT_WAKE_EVENT_SDDL.contains(";;;IU"));
+    fn wake_event_sddl_is_scoped_to_the_current_user() {
+        let descriptor = wake_event_security_descriptor().expect("wake descriptor");
+        let current_sid = crate::current_user_sid_string().expect("current user SID");
+
+        assert!(descriptor.contains("0x00100002"));
+        assert!(descriptor.contains(";;;SY"));
+        assert!(descriptor.contains(";;;BA"));
+        assert!(descriptor.contains(&format!(";;;{current_sid}")));
+        assert!(!descriptor.contains(";;;IU"));
     }
 }

@@ -28,6 +28,19 @@ export interface PublishedAgentState {
   last_error?: string | null;
   process_alive?: boolean | null;
   ipc_connected?: boolean | null;
+  wmi_watchers?: WmiWatcherStatus;
+}
+
+export interface WmiWatcherChannelStatus {
+  state: 'starting' | 'running' | 'degraded';
+  last_transition_ms: number;
+  retry_in_ms?: number | null;
+  last_error?: string | null;
+}
+
+export interface WmiWatcherStatus {
+  starts: WmiWatcherChannelStatus;
+  stops: WmiWatcherChannelStatus;
 }
 
 export type AgentStateTone = 'ready' | 'idle' | 'warning' | 'error';
@@ -101,6 +114,10 @@ export function describeAgentState(
     return state.last_error;
   }
 
+  if (wmiWatchersDegraded(state)) {
+    return 'Agente activo; eventos WMI degradados, usando respaldo adaptativo';
+  }
+
   if (state.last_scan) {
     return describeAgentScan(state.last_scan);
   }
@@ -120,7 +137,7 @@ export function agentStateTone(
   if (!state) return taskReady ? 'warning' : 'idle';
   if (isAgentStateStale(state, now)) return 'warning';
   if (state.last_error || state.status === 'error' || state.status === 'stopped') return 'error';
-  if (state.status === 'starting' || state.status === 'paused') return 'warning';
+  if (state.status === 'starting' || state.status === 'paused' || wmiWatchersDegraded(state)) return 'warning';
   return 'ready';
 }
 
@@ -137,6 +154,8 @@ export function agentStateSignature(state: PublishedAgentState | null): string {
     state.ipc_connected === true ? 'ipc' : 'fallback',
     state.status,
     state.last_error ?? '',
+    state.wmi_watchers?.starts.state ?? '',
+    state.wmi_watchers?.stops.state ?? '',
     scan?.matched_profile_id ?? '',
     scan?.matched_profile_name ?? '',
     scan?.target_plan_id ?? '',
@@ -146,6 +165,10 @@ export function agentStateSignature(state: PublishedAgentState | null): string {
     scan?.restore_scheduled ? '1' : '0',
     scan?.restored_power_plan ? '1' : '0',
   ].join('|');
+}
+
+function wmiWatchersDegraded(state: PublishedAgentState): boolean {
+  return state.wmi_watchers?.starts.state === 'degraded' || state.wmi_watchers?.stops.state === 'degraded';
 }
 
 export function applyAgentScanToGames(games: UiGameProfile[], scan: AgentScanResult): UiGameProfile[] {

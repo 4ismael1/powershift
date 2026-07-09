@@ -1,5 +1,8 @@
 use crate::ipc::AgentSharedState;
-use crate::{now_ms, AgentPaths, AgentScanResult, ProcessTrackingStatus, PublishedAgentState};
+use crate::{
+    now_ms, AgentPaths, AgentScanResult, ProcessTrackingStatus, PublishedAgentState,
+    WmiWatcherStatus,
+};
 use powershift_core::AgentStatus;
 use powershift_windows::PowerManagerBackend;
 use serde::{Deserialize, Serialize};
@@ -12,6 +15,7 @@ pub(crate) struct AgentPublishMemory {
     pub(crate) last_scan: Option<AgentScanResult>,
     pub(crate) last_error: Option<String>,
     pub(crate) process_tracking: ProcessTrackingStatus,
+    pub(crate) wmi_watchers: WmiWatcherStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +83,7 @@ pub(crate) fn publish_scan_outcome_with_shared(
                         last_scan: Some(scan),
                         last_error: None,
                         process_tracking: memory.process_tracking.clone(),
+                        wmi_watchers: memory.wmi_watchers.clone(),
                     },
                     shared_state,
                 );
@@ -102,6 +107,7 @@ pub(crate) fn publish_scan_outcome_with_shared(
                         last_scan: memory.last_scan.clone(),
                         last_error: Some(message),
                         process_tracking: memory.process_tracking.clone(),
+                        wmi_watchers: memory.wmi_watchers.clone(),
                     },
                     shared_state,
                 );
@@ -142,6 +148,7 @@ pub(crate) fn publish_error_with_shared(
                 last_scan: memory.last_scan.clone(),
                 last_error: Some(message),
                 process_tracking: memory.process_tracking.clone(),
+                wmi_watchers: memory.wmi_watchers.clone(),
             },
             shared_state,
         );
@@ -174,6 +181,7 @@ pub(crate) fn publish_heartbeat_with_shared(
             last_scan: memory.last_scan.clone(),
             last_error: memory.last_error.clone(),
             process_tracking: memory.process_tracking.clone(),
+            wmi_watchers: memory.wmi_watchers.clone(),
         });
     }
     Ok(())
@@ -252,6 +260,19 @@ pub fn append_event_to_path(path: PathBuf, entry: &EventLogEntry) -> Result<(), 
     Ok(())
 }
 
+pub(crate) fn clear_event_history_at_path(path: &Path) -> Result<(), String> {
+    remove_event_file_if_present(path)?;
+    remove_event_file_if_present(&path.with_extension("jsonl.1"))
+}
+
+fn remove_event_file_if_present(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 pub fn publish_state(path: &PathBuf, state: PublishedAgentState) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
@@ -320,6 +341,8 @@ fn publish_state_best_effort_with_shared(
         shared_state.set(state.clone());
     }
     publish_state_best_effort(path, state);
+    let _ =
+        powershift_windows::signal_ipc_event(powershift_windows::AGENT_STATE_UPDATED_EVENT_NAME);
 }
 
 fn rotate_event_log_if_needed(path: &PathBuf) -> Result<(), String> {

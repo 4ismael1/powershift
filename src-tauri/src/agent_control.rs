@@ -45,7 +45,9 @@ pub fn get_agent_state() -> Result<Option<AgentStateResponse>, String> {
         return Ok(Some(agent_state_response_from_ipc(state)));
     }
 
-    let path = AgentPaths::from_app_data().state;
+    let path = AgentPaths::from_environment()
+        .map_err(|error| error.to_string())?
+        .state;
     if !path.exists() {
         return Ok(None);
     }
@@ -512,6 +514,7 @@ mod tests {
             last_scan: None,
             last_error: None,
             process_tracking: Default::default(),
+            wmi_watchers: Default::default(),
         });
 
         assert!(response.process_alive);
@@ -527,6 +530,7 @@ mod tests {
             last_scan: None,
             last_error: None,
             process_tracking: Default::default(),
+            wmi_watchers: Default::default(),
         });
 
         assert!(response.process_alive);
@@ -545,6 +549,7 @@ mod tests {
                     .to_string(),
             ),
             process_tracking: Default::default(),
+            wmi_watchers: Default::default(),
         };
 
         assert!(agent_state_requires_elevated_restart(&state));
@@ -565,6 +570,7 @@ mod tests {
             last_scan: None,
             last_error: Some("No se pudo leer config.json".to_string()),
             process_tracking: Default::default(),
+            wmi_watchers: Default::default(),
         };
 
         assert!(!agent_state_requires_elevated_restart(&state));

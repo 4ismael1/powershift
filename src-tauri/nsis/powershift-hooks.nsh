@@ -44,6 +44,13 @@ FunctionEnd
   ; The tray remains a normal user process so opening the UI never requires elevation.
   Call PowerShiftReadExistingConfigFlags
 
+  ; Runtime state now lives in a high-integrity ProgramData directory. Remove
+  ; legacy elevated output from the user-writable config directory.
+  Delete "$APPDATA\PowerShift\agent-state.json"
+  Delete "$APPDATA\PowerShift\agent-control.token"
+  Delete "$APPDATA\PowerShift\events.jsonl"
+  Delete "$APPDATA\PowerShift\events.jsonl.1"
+
   nsExec::ExecToLog `powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$agentPath = '$INSTDIR\powershift-agent.exe'; $$action = New-ScheduledTaskAction -Execute $$agentPath; $$trigger = New-ScheduledTaskTrigger -AtLogOn; $$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); $$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $$principal = New-ScheduledTaskPrincipal -UserId $$user -LogonType Interactive -RunLevel Highest; Register-ScheduledTask -TaskName 'PowerShiftAgent' -Action $$action -Trigger $$trigger -Settings $$settings -Principal $$principal -Force | Out-Null"`
   Pop $0
 
@@ -81,5 +88,6 @@ FunctionEnd
   RMDir /r "$APPDATA\PowerShift"
   RMDir /r "$LOCALAPPDATA\com.powershift.desktop"
   RMDir /r "$LOCALAPPDATA\PowerShift"
+  RMDir /r "$PROGRAMDATA\PowerShift"
   Delete "$TEMP\powershift-exe-icon.png"
 !macroend

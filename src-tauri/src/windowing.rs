@@ -1,12 +1,15 @@
 use crate::config::{default_config_path, load_or_create_config};
 use powershift_core::CloseButtonBehavior;
-use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, Window, WindowEvent,
+};
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const MAIN_WINDOW_WIDTH: f64 = 958.0;
 const MAIN_WINDOW_HEIGHT: f64 = 598.0;
 const MAIN_WINDOW_MIN_WIDTH: f64 = 860.0;
 const MAIN_WINDOW_MIN_HEIGHT: f64 = 520.0;
+const AGENT_STATE_CHANGED_EVENT: &str = "powershift://agent-state-changed";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseAction {
@@ -24,8 +27,26 @@ pub fn close_action_for_behavior(behavior: CloseButtonBehavior) -> CloseAction {
 pub fn configure_windowing<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     start_ui_show_listener(app.clone());
     start_ui_exit_listener(app.clone());
+    start_agent_state_listener(app.clone());
     apply_startup_visibility(app)?;
     Ok(())
+}
+
+fn start_agent_state_listener<R: Runtime>(app: AppHandle<R>) {
+    std::thread::spawn(move || {
+        let Ok(handle) = powershift_windows::create_ipc_event(
+            powershift_windows::AGENT_STATE_UPDATED_EVENT_NAME,
+        ) else {
+            return;
+        };
+
+        loop {
+            if powershift_windows::wait_for_ipc_event(handle).is_err() {
+                break;
+            }
+            let _ = app.emit(AGENT_STATE_CHANGED_EVENT, ());
+        }
+    });
 }
 
 pub fn should_start_hidden<I, S>(args: I) -> bool
@@ -214,5 +235,14 @@ mod tests {
             .expect("window backgroundColor should be a string");
 
         assert_eq!(background, "#090d0d");
+    }
+
+    #[test]
+    fn agent_state_changes_are_forwarded_to_the_webview() {
+        let source = include_str!("windowing.rs");
+
+        assert!(source.contains("AGENT_STATE_UPDATED_EVENT_NAME"));
+        assert!(source.contains("powershift://agent-state-changed"));
+        assert!(source.contains("app.emit"));
     }
 }

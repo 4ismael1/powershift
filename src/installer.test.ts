@@ -52,6 +52,9 @@ describe('installer background architecture', () => {
     expect(installerHooks).toContain('PowerShiftTray');
     expect(installerHooks).toContain('powershift-tray.exe');
     expect(installerHooks).toContain('nsis_tauri_utils::RunAsUser');
+    expect(postInstall).toContain('Delete "$APPDATA\\PowerShift\\agent-state.json"');
+    expect(postInstall).toContain('Delete "$APPDATA\\PowerShift\\agent-control.token"');
+    expect(postInstall).toContain('Delete "$APPDATA\\PowerShift\\events.jsonl"');
     expect(preUninstall).toContain('schtasks /End /TN "PowerShiftAgent"');
     expect(preUninstall).toContain('schtasks /Delete /F /TN "PowerShiftAgent"');
     expect(installerHooks).toContain('DeleteRegValue HKCU');
@@ -59,6 +62,7 @@ describe('installer background architecture', () => {
     expect(preUninstall).toContain('Sleep 1200');
     expect(preUninstall).toContain('RMDir /r "$APPDATA\\PowerShift"');
     expect(preUninstall).toContain('RMDir /r "$LOCALAPPDATA\\com.powershift.desktop"');
+    expect(preUninstall).toContain('RMDir /r "$PROGRAMDATA\\PowerShift"');
     expect(preUninstall).toContain('Delete "$TEMP\\powershift-exe-icon.png"');
   });
 });

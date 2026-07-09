@@ -9,8 +9,9 @@ mod publisher;
 mod scheduler;
 
 pub use ipc::{
-    request_agent_reevaluate_via_ipc, request_agent_shutdown_via_ipc, request_agent_status_via_ipc,
-    AgentIpcRequest, AgentIpcResponse,
+    request_agent_clear_events_via_ipc, request_agent_reevaluate_via_ipc,
+    request_agent_shutdown_via_ipc, request_agent_status_via_ipc, AgentIpcRequest,
+    AgentIpcResponse,
 };
 pub use paths::AgentPaths;
 pub use publisher::{append_event_to_path, publish_state, EventLogEntry};
@@ -41,7 +42,6 @@ use scheduler::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
@@ -95,6 +95,8 @@ pub struct PublishedAgentState {
     pub last_error: Option<String>,
     #[serde(default)]
     pub process_tracking: ProcessTrackingStatus,
+    #[serde(default)]
+    pub wmi_watchers: WmiWatcherStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -105,22 +107,82 @@ pub struct ProcessTrackingStatus {
     pub pending_targeted_inspections: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct AgentWatcherHealth {
-    degraded_watchers: BTreeSet<powershift_windows::ProcessWatcherKind>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WmiWatcherState {
+    #[default]
+    Starting,
+    Running,
+    Degraded,
 }
 
-impl AgentWatcherHealth {
-    fn mark_healthy(&mut self, kind: powershift_windows::ProcessWatcherKind) {
-        self.degraded_watchers.remove(&kind);
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WmiWatcherChannelStatus {
+    pub state: WmiWatcherState,
+    pub last_transition_ms: u64,
+    pub retry_in_ms: Option<u64>,
+    pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct WmiWatcherStatus {
+    pub starts: WmiWatcherChannelStatus,
+    pub stops: WmiWatcherChannelStatus,
+}
+
+impl WmiWatcherStatus {
+    fn mark_healthy(&mut self, kind: powershift_windows::ProcessWatcherKind, now_ms: u64) {
+        let channel = self.channel_mut(kind);
+        channel.state = WmiWatcherState::Running;
+        channel.last_transition_ms = now_ms;
+        channel.retry_in_ms = None;
+        channel.last_error = None;
     }
 
-    fn mark_degraded(&mut self, kind: powershift_windows::ProcessWatcherKind) {
-        self.degraded_watchers.insert(kind);
+    fn mark_degraded(
+        &mut self,
+        kind: powershift_windows::ProcessWatcherKind,
+        error: String,
+        retry_in_ms: u64,
+        now_ms: u64,
+    ) {
+        let channel = self.channel_mut(kind);
+        channel.state = WmiWatcherState::Degraded;
+        channel.last_transition_ms = now_ms;
+        channel.retry_in_ms = Some(retry_in_ms);
+        channel.last_error = Some(error);
     }
 
     fn is_degraded(&self) -> bool {
-        !self.degraded_watchers.is_empty()
+        self.starts.state == WmiWatcherState::Degraded
+            || self.stops.state == WmiWatcherState::Degraded
+    }
+
+    fn channel_mut(
+        &mut self,
+        kind: powershift_windows::ProcessWatcherKind,
+    ) -> &mut WmiWatcherChannelStatus {
+        match kind {
+            powershift_windows::ProcessWatcherKind::Starts => &mut self.starts,
+            powershift_windows::ProcessWatcherKind::Stops => &mut self.stops,
+        }
+    }
+}
+
+fn synchronize_watcher_health(
+    watcher_health: &WmiWatcherStatus,
+    shared_state: &AgentSharedState,
+    publish_memory: &mut AgentPublishMemory,
+) {
+    publish_memory.wmi_watchers = watcher_health.clone();
+    if let Some(mut state) = shared_state.get() {
+        if state.wmi_watchers != *watcher_health {
+            state.wmi_watchers = watcher_health.clone();
+            shared_state.set(state);
+            let _ = powershift_windows::signal_ipc_event(
+                powershift_windows::AGENT_STATE_UPDATED_EVENT_NAME,
+            );
+        }
     }
 }
 
@@ -155,11 +217,14 @@ fn synchronize_exit_watches(
 }
 
 pub fn run_agent_forever() -> Result<(), String> {
-    let paths = AgentPaths::from_app_data();
+    let paths = AgentPaths::from_environment().map_err(|error| error.to_string())?;
+    paths
+        .prepare_runtime_directory()
+        .map_err(|error| error.to_string())?;
     let mut runtime = AgentRuntimeState::default();
     let mut publish_memory = AgentPublishMemory::default();
     let mut scheduler = AgentScanScheduler::default();
-    let mut watcher_health = AgentWatcherHealth::default();
+    let mut watcher_health = WmiWatcherStatus::default();
     let mut process_registry = ProcessRegistry::default();
     let mut exit_watches = ProcessExitWatchSet::default();
     let mut pending_inspections = TargetedInspectionQueue::default();
@@ -175,12 +240,18 @@ pub fn run_agent_forever() -> Result<(), String> {
         last_scan: None,
         last_error: None,
         process_tracking: ProcessTrackingStatus::default(),
+        wmi_watchers: WmiWatcherStatus::default(),
     };
     shared_state.set(starting_state.clone());
     publish_state(&paths.state, starting_state)?;
 
     let (sender, receiver) = mpsc::channel();
-    spawn_agent_ipc_server(sender.clone(), shared_state.clone(), control_token);
+    spawn_agent_ipc_server(
+        sender.clone(),
+        shared_state.clone(),
+        control_token,
+        paths.events.clone(),
+    );
     let _process_watchers = spawn_process_event_watchers(sender.clone());
     let wake_sender = sender.clone();
     std::thread::spawn(move || {
@@ -325,11 +396,17 @@ pub fn run_agent_forever() -> Result<(), String> {
                 publish_error_with_shared(&paths, &error, &mut publish_memory, Some(&shared_state))?
             }
             Ok(ProcessWatchMessage::WatcherHealthy(kind)) => {
-                watcher_health.mark_healthy(kind);
+                watcher_health.mark_healthy(kind, now_ms());
+                synchronize_watcher_health(&watcher_health, &shared_state, &mut publish_memory);
                 scheduler.schedule_forced(now_ms());
             }
-            Ok(ProcessWatchMessage::WatcherDegraded { kind, error, .. }) => {
-                watcher_health.mark_degraded(kind);
+            Ok(ProcessWatchMessage::WatcherDegraded {
+                kind,
+                error,
+                retry_in_ms,
+            }) => {
+                watcher_health.mark_degraded(kind, error.clone(), retry_in_ms, now_ms());
+                synchronize_watcher_health(&watcher_health, &shared_state, &mut publish_memory);
                 scheduler.schedule_forced(now_ms());
                 publish_error_with_shared(
                     &paths,
@@ -442,7 +519,10 @@ pub fn run_agent_forever() -> Result<(), String> {
 }
 
 pub fn run_scan_once() -> Result<AgentScanResult, String> {
-    let paths = AgentPaths::from_app_data();
+    let paths = AgentPaths::from_environment().map_err(|error| error.to_string())?;
+    paths
+        .prepare_runtime_directory()
+        .map_err(|error| error.to_string())?;
     let mut runtime = AgentRuntimeState::default();
     run_agent_scan_with_paths(
         &paths,
@@ -462,7 +542,7 @@ where
     P: ProcessSnapshotBackend,
     W: PowerManagerBackend,
 {
-    let config = load_or_create_config(paths.config.clone())?;
+    let config = load_agent_config(&paths.config)?;
     let result =
         evaluate_agent_scan_stateful(&config, process_backend, power_backend, state, now_ms());
     write_scan_event(&paths.events, &result, power_backend);
@@ -480,7 +560,7 @@ where
     P: ProcessSnapshotBackend,
     W: PowerManagerBackend,
 {
-    let config = match load_or_create_config(paths.config.clone()) {
+    let config = match load_agent_config(&paths.config) {
         Ok(config) => config,
         Err(error) => return (Err(error), AgentWatchSet::default()),
     };
@@ -504,7 +584,7 @@ where
     P: ProcessSnapshotBackend,
     W: PowerManagerBackend,
 {
-    let next_config = load_or_create_config(paths.config.clone())?;
+    let next_config = load_agent_config(&paths.config)?;
     let next_watch_set = AgentWatchSet::from_config(&next_config);
     *config = next_config;
     *watch_set = next_watch_set;
@@ -896,17 +976,11 @@ fn restore_due_at(state: &AgentRuntimeState, now_ms: u64) -> bool {
         .is_some_and(|restore| restore.due_at_ms <= now_ms)
 }
 
-fn load_or_create_config(path: PathBuf) -> Result<AppConfig, String> {
+fn load_agent_config(path: &std::path::Path) -> Result<AppConfig, String> {
     if path.exists() {
         return ConfigStore::load(path).map_err(|error| error.to_string());
     }
-
-    let config = AppConfig::default();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    ConfigStore::save(path, &config).map_err(|error| error.to_string())?;
-    Ok(config)
+    Ok(AppConfig::default())
 }
 
 fn now_ms() -> u64 {
@@ -1023,6 +1097,17 @@ mod tests {
     fn read_published_state(paths: &AgentPaths) -> PublishedAgentState {
         let value = std::fs::read_to_string(&paths.state).expect("read state");
         serde_json::from_str(&value).expect("parse state")
+    }
+
+    #[test]
+    fn missing_config_uses_defaults_without_an_elevated_write() {
+        let paths = temp_agent_paths("read-only-default-config");
+
+        let config = load_agent_config(&paths.config).expect("default config");
+
+        assert_eq!(config, AppConfig::default());
+        assert!(!paths.config.exists());
+        let _ = std::fs::remove_dir_all(paths.runtime_dir());
     }
 
     #[test]
@@ -1217,6 +1302,18 @@ mod tests {
 
     const IPC_TEST_TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
+    fn handle_test_ipc_request(
+        request: &str,
+        shared: &AgentSharedState,
+        sender: &mpsc::Sender<ProcessWatchMessage>,
+    ) -> String {
+        let event_log = std::env::temp_dir().join(format!(
+            "powershift-ipc-events-{}.jsonl",
+            std::process::id()
+        ));
+        handle_agent_ipc_request(request, shared, sender, IPC_TEST_TOKEN, &event_log)
+    }
+
     #[test]
     fn ipc_status_returns_live_memory_state() {
         let state = PublishedAgentState {
@@ -1226,18 +1323,15 @@ mod tests {
             last_scan: Some(active_scan()),
             last_error: None,
             process_tracking: ProcessTrackingStatus::default(),
+            wmi_watchers: WmiWatcherStatus::default(),
         };
         let shared = shared_state_with(state.clone());
         let (sender, _receiver) = mpsc::channel();
         let request = serde_json::to_string(&AgentIpcRequest::GetStatus).expect("request json");
 
-        let response: AgentIpcResponse = serde_json::from_str(&handle_agent_ipc_request(
-            &request,
-            &shared,
-            &sender,
-            IPC_TEST_TOKEN,
-        ))
-        .expect("response json");
+        let response: AgentIpcResponse =
+            serde_json::from_str(&handle_test_ipc_request(&request, &shared, &sender))
+                .expect("response json");
 
         assert!(response.ok);
         assert_eq!(response.state, Some(state));
@@ -1252,6 +1346,7 @@ mod tests {
             last_scan: None,
             last_error: None,
             process_tracking: ProcessTrackingStatus::default(),
+            wmi_watchers: WmiWatcherStatus::default(),
         });
         let (sender, receiver) = mpsc::channel();
         let request = serde_json::to_string(&AgentIpcRequest::Reevaluate {
@@ -1259,13 +1354,9 @@ mod tests {
         })
         .expect("request json");
 
-        let response: AgentIpcResponse = serde_json::from_str(&handle_agent_ipc_request(
-            &request,
-            &shared,
-            &sender,
-            IPC_TEST_TOKEN,
-        ))
-        .expect("response json");
+        let response: AgentIpcResponse =
+            serde_json::from_str(&handle_test_ipc_request(&request, &shared, &sender))
+                .expect("response json");
 
         assert!(response.ok);
         assert_eq!(
@@ -1283,13 +1374,9 @@ mod tests {
         })
         .expect("request json");
 
-        let response: AgentIpcResponse = serde_json::from_str(&handle_agent_ipc_request(
-            &request,
-            &shared,
-            &sender,
-            IPC_TEST_TOKEN,
-        ))
-        .expect("response json");
+        let response: AgentIpcResponse =
+            serde_json::from_str(&handle_test_ipc_request(&request, &shared, &sender))
+                .expect("response json");
 
         assert!(response.ok);
         assert_eq!(
@@ -1307,16 +1394,42 @@ mod tests {
         })
         .expect("request json");
 
+        let response: AgentIpcResponse =
+            serde_json::from_str(&handle_test_ipc_request(&request, &shared, &sender))
+                .expect("response json");
+
+        assert!(!response.ok);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn ipc_clear_events_removes_current_and_rotated_logs() {
+        let path = std::env::temp_dir().join(format!(
+            "powershift-ipc-clear-events-{}.jsonl",
+            std::process::id()
+        ));
+        let rotated = path.with_extension("jsonl.1");
+        std::fs::write(&path, "current").expect("seed current log");
+        std::fs::write(&rotated, "rotated").expect("seed rotated log");
+        let shared = AgentSharedState::default();
+        let (sender, _receiver) = mpsc::channel();
+        let request = serde_json::to_string(&AgentIpcRequest::ClearEvents {
+            token: Some(IPC_TEST_TOKEN.to_string()),
+        })
+        .expect("request json");
+
         let response: AgentIpcResponse = serde_json::from_str(&handle_agent_ipc_request(
             &request,
             &shared,
             &sender,
             IPC_TEST_TOKEN,
+            &path,
         ))
         .expect("response json");
 
-        assert!(!response.ok);
-        assert!(receiver.try_recv().is_err());
+        assert!(response.ok);
+        assert!(!path.exists());
+        assert!(!rotated.exists());
     }
 
     #[test]
@@ -1787,7 +1900,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_publish_preserves_process_tracking_status() {
+    fn scan_publish_preserves_process_tracking_and_watcher_health() {
         let paths = temp_agent_paths("scan-publish-tracking");
         let tracking = ProcessTrackingStatus {
             tracked_instances: 3,
@@ -1795,14 +1908,25 @@ mod tests {
             unavailable_exit_waits: 1,
             pending_targeted_inspections: 0,
         };
+        let mut watchers = WmiWatcherStatus::default();
+        watchers.mark_healthy(powershift_windows::ProcessWatcherKind::Starts, 50);
+        watchers.mark_degraded(
+            powershift_windows::ProcessWatcherKind::Stops,
+            "WMI unavailable".to_string(),
+            1_000,
+            60,
+        );
         let mut memory = AgentPublishMemory {
             process_tracking: tracking.clone(),
+            wmi_watchers: watchers.clone(),
             ..AgentPublishMemory::default()
         };
 
         publish_scan_outcome(&paths, Ok(active_scan()), &mut memory).expect("publish scan");
 
-        assert_eq!(read_published_state(&paths).process_tracking, tracking);
+        let state = read_published_state(&paths);
+        assert_eq!(state.process_tracking, tracking);
+        assert_eq!(state.wmi_watchers, watchers);
         let _ = std::fs::remove_dir_all(paths.state.parent().expect("state parent"));
     }
 
@@ -1813,6 +1937,7 @@ mod tests {
             last_scan: Some(active_scan()),
             last_error: None,
             process_tracking: ProcessTrackingStatus::default(),
+            wmi_watchers: WmiWatcherStatus::default(),
         };
 
         publish_error(&paths, "HRESULT Call failed with: 0x80041003", &mut memory)
@@ -1842,6 +1967,7 @@ mod tests {
                 unavailable_exit_waits: 0,
                 pending_targeted_inspections: 0,
             },
+            wmi_watchers: WmiWatcherStatus::default(),
         };
         let shared = AgentSharedState::default();
 
@@ -1867,6 +1993,7 @@ mod tests {
             last_scan: Some(active_scan()),
             last_error: None,
             process_tracking: ProcessTrackingStatus::default(),
+            wmi_watchers: WmiWatcherStatus::default(),
         };
         let temp_path = paths
             .state
@@ -1898,6 +2025,7 @@ mod tests {
                 last_scan: None,
                 last_error: None,
                 process_tracking: ProcessTrackingStatus::default(),
+                wmi_watchers: WmiWatcherStatus::default(),
             },
         )
         .expect("publish state");
@@ -2003,8 +2131,13 @@ mod tests {
 
     #[test]
     fn degraded_watcher_caps_wait_to_adaptive_scan_interval() {
-        let mut health = AgentWatcherHealth::default();
-        health.mark_degraded(powershift_windows::ProcessWatcherKind::Starts);
+        let mut health = WmiWatcherStatus::default();
+        health.mark_degraded(
+            powershift_windows::ProcessWatcherKind::Starts,
+            "test".to_string(),
+            1_000,
+            10,
+        );
 
         assert_eq!(
             next_wait_with_scheduler(

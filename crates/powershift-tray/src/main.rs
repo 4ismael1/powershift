@@ -154,10 +154,9 @@ fn agent_ipc_request_with_token(command: &str, token: Option<String>) -> serde_j
 
 #[cfg(windows)]
 fn read_agent_control_token() -> Option<String> {
-    let path = std::env::var_os("APPDATA")
-        .map(std::path::PathBuf::from)?
-        .join("PowerShift")
-        .join("agent-control.token");
+    let path = powershift_windows::PowerShiftPaths::from_environment()
+        .ok()?
+        .control_token();
     let token = std::fs::read_to_string(path).ok()?;
     let token = token.trim();
     (token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -181,20 +180,18 @@ mod tray {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-        DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, LoadIconW, PostQuitMessage,
-        RegisterClassW, SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage,
-        CS_HREDRAW, CS_VREDRAW, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN,
-        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-        WM_COMMAND, WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WM_TIMER,
-        WNDCLASSW,
+        DispatchMessageW, GetCursorPos, GetMessageW, LoadIconW, PostQuitMessage, RegisterClassW,
+        SetForegroundWindow, TrackPopupMenu, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+        IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+        TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_COMMAND,
+        WM_DESTROY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW,
     };
 
     const TRAY_UID: u32 = 1;
-    const TOOLTIP_TIMER_ID: usize = 7;
-    const TOOLTIP_REFRESH_MS: u32 = 15_000;
     pub(super) const WM_TRAY: u32 = WM_APP + 42;
     pub(super) const WM_TRAY_QUIT: u32 = WM_APP + 43;
     pub(super) const WM_EVENT_LOG_UPDATED: u32 = WM_APP + 44;
+    pub(super) const WM_AGENT_STATE_UPDATED: u32 = WM_APP + 45;
     pub(super) const WM_CONTEXTMENU_VALUE: u32 = 0x007b;
     pub(super) const NIN_SELECT_VALUE: u32 = 0x0400;
     pub(super) const NIN_KEYSELECT_VALUE: u32 = 0x0401;
@@ -207,11 +204,9 @@ mod tray {
         add_tray_icon(hwnd)?;
         refresh_tray_tooltip(hwnd);
         prime_notification_cursor();
-        unsafe {
-            let _ = SetTimer(Some(hwnd), TOOLTIP_TIMER_ID, TOOLTIP_REFRESH_MS, None);
-        }
         spawn_quit_listener(hwnd);
         spawn_event_log_listener(hwnd);
+        spawn_agent_state_listener(hwnd);
 
         let mut message = MSG::default();
         loop {
@@ -362,10 +357,9 @@ mod tray {
             }
         }
 
-        let path = std::env::var_os("APPDATA")
-            .map(std::path::PathBuf::from)?
-            .join("PowerShift")
-            .join("agent-state.json");
+        let path = powershift_windows::PowerShiftPaths::from_environment()
+            .ok()?
+            .state;
         let value = std::fs::read_to_string(path).ok()?;
         profile_name_from_state_json(&value)
     }
@@ -458,10 +452,9 @@ mod tray {
     }
 
     fn latest_event() -> Option<serde_json::Value> {
-        let path = std::env::var_os("APPDATA")
-            .map(std::path::PathBuf::from)?
-            .join("PowerShift")
-            .join("events.jsonl");
+        let path = powershift_windows::PowerShiftPaths::from_environment()
+            .ok()?
+            .events;
         let value = std::fs::read_to_string(path).ok()?;
         value
             .lines()
@@ -586,6 +579,32 @@ mod tray {
         });
     }
 
+    fn spawn_agent_state_listener(hwnd: HWND) {
+        let hwnd_value = hwnd.0 as isize;
+        std::thread::spawn(move || {
+            let Ok(handle) = powershift_windows::create_ipc_event(
+                powershift_windows::AGENT_STATE_UPDATED_EVENT_NAME,
+            ) else {
+                return;
+            };
+
+            loop {
+                if powershift_windows::wait_for_ipc_event(handle).is_err() {
+                    break;
+                }
+                unsafe {
+                    let hwnd = HWND(hwnd_value as *mut _);
+                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(hwnd),
+                        WM_AGENT_STATE_UPDATED,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+        });
+    }
+
     unsafe extern "system" fn window_proc(
         hwnd: HWND,
         message: u32,
@@ -606,7 +625,7 @@ mod tray {
                 show_context_menu(hwnd);
                 LRESULT(0)
             }
-            WM_TIMER if wparam.0 == TOOLTIP_TIMER_ID => {
+            WM_AGENT_STATE_UPDATED => {
                 refresh_tray_tooltip(hwnd);
                 LRESULT(0)
             }
@@ -622,7 +641,6 @@ mod tray {
                 LRESULT(0)
             },
             WM_DESTROY => {
-                let _ = unsafe { KillTimer(Some(hwnd), TOOLTIP_TIMER_ID) };
                 remove_tray_icon(hwnd);
                 PostQuitMessage(0);
                 LRESULT(0)

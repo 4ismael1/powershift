@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import {
   Activity,
   CheckCircle2,
@@ -108,10 +109,12 @@ const appReady = ref(false);
 const notice = ref<{ kind: 'success' | 'info' | 'error'; message: string } | null>(null);
 let noticeTimer: number | undefined;
 let agentSnapshotTimer: number | undefined;
+let unlistenAgentState: UnlistenFn | undefined;
 let processIconLoadId = 0;
 let lastAgentStateSignature: string | undefined;
 let lastPublishedAgentState: PublishedAgentState | null = null;
 let agentSnapshotInFlight = false;
+let agentSnapshotPending = false;
 
 const tauriInvoke: InvokeFn = (command, args) => invoke(command, args);
 
@@ -706,7 +709,10 @@ function applyAgentState(state: PublishedAgentState | null) {
 async function refreshAgentSnapshot(
   options: { refreshPower?: boolean; refreshEvents?: boolean; forceLinkedRefresh?: boolean } = {},
 ) {
-  if (agentSnapshotInFlight) return;
+  if (agentSnapshotInFlight) {
+    agentSnapshotPending = true;
+    return;
+  }
 
   agentSnapshotInFlight = true;
   const refreshPower = options.refreshPower ?? true;
@@ -725,6 +731,21 @@ async function refreshAgentSnapshot(
     powerError.value = error instanceof Error ? error.message : String(error);
   } finally {
     agentSnapshotInFlight = false;
+    if (agentSnapshotPending) {
+      agentSnapshotPending = false;
+      void refreshAgentSnapshot();
+    }
+  }
+}
+
+async function subscribeToAgentState() {
+  if (!('__TAURI_INTERNALS__' in window)) return;
+  try {
+    unlistenAgentState = await listen('powershift://agent-state-changed', () => {
+      void refreshAgentSnapshot();
+    });
+  } catch {
+    unlistenAgentState = undefined;
   }
 }
 
@@ -787,15 +808,17 @@ async function finishStartupRefresh() {
 }
 
 onMounted(() => {
+  void subscribeToAgentState();
   void initializeApp();
   agentSnapshotTimer = window.setInterval(() => {
     void refreshAgentSnapshot();
-  }, 2500);
+  }, 30_000);
 });
 
 onBeforeUnmount(() => {
   if (noticeTimer) window.clearTimeout(noticeTimer);
   if (agentSnapshotTimer) window.clearInterval(agentSnapshotTimer);
+  unlistenAgentState?.();
 });
 
 async function minimize() {

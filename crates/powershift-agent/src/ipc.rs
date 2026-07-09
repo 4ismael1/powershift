@@ -1,7 +1,7 @@
 use crate::{AgentPaths, PublishedAgentState};
 use powershift_windows::ProcessWatchMessage;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{mpsc::Sender, Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -9,6 +9,7 @@ use std::sync::{mpsc::Sender, Arc, Mutex};
 pub enum AgentIpcRequest {
     GetStatus,
     Reevaluate { token: Option<String> },
+    ClearEvents { token: Option<String> },
     Shutdown { token: Option<String> },
 }
 
@@ -75,6 +76,19 @@ pub fn request_agent_shutdown_via_ipc() -> Result<(), String> {
     }
 }
 
+pub fn request_agent_clear_events_via_ipc() -> Result<(), String> {
+    let response = call_agent_ipc(AgentIpcRequest::ClearEvents {
+        token: read_control_token_from_app_data(),
+    })?;
+    if response.ok {
+        Ok(())
+    } else {
+        Err(response
+            .message
+            .unwrap_or_else(|| "El agente no pudo borrar los eventos.".to_string()))
+    }
+}
+
 pub(crate) fn load_or_create_control_token(path: &Path) -> Result<String, String> {
     if let Ok(token) = read_control_token(path) {
         return Ok(token);
@@ -93,11 +107,18 @@ pub(crate) fn spawn_agent_ipc_server(
     sender: Sender<ProcessWatchMessage>,
     shared_state: AgentSharedState,
     control_token: String,
+    event_log_path: PathBuf,
 ) {
     std::thread::spawn(move || {
         let pipe_name = powershift_windows::agent_pipe_name();
         let _ = powershift_windows::run_named_pipe_server(&pipe_name, move |request| {
-            handle_agent_ipc_request(&request, &shared_state, &sender, &control_token)
+            handle_agent_ipc_request(
+                &request,
+                &shared_state,
+                &sender,
+                &control_token,
+                &event_log_path,
+            )
         });
     });
 }
@@ -111,7 +132,8 @@ fn call_agent_ipc(request: AgentIpcRequest) -> Result<AgentIpcResponse, String> 
 }
 
 fn read_control_token_from_app_data() -> Option<String> {
-    read_control_token(&AgentPaths::from_app_data().control_token()).ok()
+    let paths = AgentPaths::from_environment().ok()?;
+    read_control_token(&paths.control_token()).ok()
 }
 
 fn read_control_token(path: &Path) -> Result<String, String> {
@@ -139,6 +161,7 @@ pub(crate) fn handle_agent_ipc_request(
     shared_state: &AgentSharedState,
     sender: &Sender<ProcessWatchMessage>,
     control_token: &str,
+    event_log_path: &Path,
 ) -> String {
     let response = match serde_json::from_str::<AgentIpcRequest>(request) {
         Ok(AgentIpcRequest::GetStatus) => match shared_state.get() {
@@ -171,6 +194,27 @@ pub(crate) fn handle_agent_ipc_request(
                     ok: false,
                     state: shared_state.get(),
                     message: Some(error.to_string()),
+                },
+            }
+        }
+        Ok(AgentIpcRequest::ClearEvents { token }) => {
+            if !control_token_matches(token.as_deref(), control_token) {
+                return agent_ipc_response_json(AgentIpcResponse {
+                    ok: false,
+                    state: shared_state.get(),
+                    message: Some("Token IPC de control invalido.".to_string()),
+                });
+            }
+            match crate::publisher::clear_event_history_at_path(event_log_path) {
+                Ok(()) => AgentIpcResponse {
+                    ok: true,
+                    state: shared_state.get(),
+                    message: Some("Historial de eventos borrado.".to_string()),
+                },
+                Err(error) => AgentIpcResponse {
+                    ok: false,
+                    state: shared_state.get(),
+                    message: Some(error),
                 },
             }
         }

@@ -60,6 +60,17 @@ The UI is intentionally not the resident worker. When the window is closed or
 hidden, the agent and tray keep the automation alive without keeping the WebView
 open.
 
+The elevated boundary is explicit: user configuration remains under
+`%APPDATA%\PowerShift`, while agent-owned state, diagnostics, and control data
+live under `%ProgramData%\PowerShift\users\<SID>`. The runtime directory uses a
+high-integrity ACL, and the session-local named pipe is restricted to the exact
+Windows user SID with bounded request size and read time. The scheduled task has
+no 72-hour execution cutoff and retries a limited number of unexpected failures.
+
+Agent state changes wake the tray and an open UI through native events. A slow
+UI reconciliation timer remains only as a safety net; the resident tray no
+longer polls the agent or active power plan every 15 seconds.
+
 ## Resource Usage
 
 PowerShift is designed around a simple rule: the background path must stay tiny,

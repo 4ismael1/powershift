@@ -1,3 +1,4 @@
+use powershift_agent::AgentPaths;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::VecDeque,
@@ -49,12 +50,10 @@ impl EventLogEntry {
     }
 }
 
-pub fn event_log_path() -> PathBuf {
-    std::env::var_os("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .join("PowerShift")
-        .join("events.jsonl")
+pub fn event_log_path() -> Result<PathBuf, String> {
+    AgentPaths::from_environment()
+        .map(|paths| paths.events)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -73,19 +72,21 @@ pub fn append_event_to_path(path: PathBuf, entry: &EventLogEntry) -> Result<(), 
 }
 
 pub fn read_recent_events(limit: usize) -> Result<Vec<EventLogEntry>, String> {
-    read_recent_events_from_path(event_log_path(), limit)
+    read_recent_events_from_path(event_log_path()?, limit)
 }
 
 pub fn clear_event_history() -> Result<(), String> {
-    clear_event_history_at_path(event_log_path())
+    powershift_agent::request_agent_clear_events_via_ipc()
 }
 
+#[cfg(test)]
 pub fn clear_event_history_at_path(path: PathBuf) -> Result<(), String> {
     remove_file_if_present(&path)?;
     remove_file_if_present(&path.with_extension("jsonl.1"))?;
     Ok(())
 }
 
+#[cfg(test)]
 fn remove_file_if_present(path: &PathBuf) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
