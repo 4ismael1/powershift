@@ -88,6 +88,7 @@ FunctionEnd
   RMDir /r "$APPDATA\PowerShift"
   RMDir /r "$LOCALAPPDATA\com.powershift.desktop"
   RMDir /r "$LOCALAPPDATA\PowerShift"
-  RMDir /r "$PROGRAMDATA\PowerShift"
+  nsExec::ExecToLog 'powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $$users = Join-Path \"$PROGRAMDATA\PowerShift\" \"users\"; $$runtime = Join-Path $$users $$sid; Remove-Item -LiteralPath $$runtime -Recurse -Force -ErrorAction SilentlyContinue; if ((Test-Path -LiteralPath $$users) -and -not (Get-ChildItem -LiteralPath $$users -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $$users -Force -ErrorAction SilentlyContinue }; $$product = \"$PROGRAMDATA\PowerShift\"; if ((Test-Path -LiteralPath $$product) -and -not (Get-ChildItem -LiteralPath $$product -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $$product -Force -ErrorAction SilentlyContinue }"'
+  Pop $0
   Delete "$TEMP\powershift-exe-icon.png"
 !macroend

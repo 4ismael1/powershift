@@ -3,10 +3,14 @@ name = "powershift-windows"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+icons = ["dep:base64", "dep:image"]
+
 [dependencies]
 powershift-core = { path = "../powershift-core" }
-base64 = "0.22"
-image = { version = "0.25", default-features = false, features = ["png"] }
+base64 = { version = "0.22", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 serde = { workspace = true }
 sysinfo = "0.30"
 

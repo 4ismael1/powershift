@@ -555,7 +555,7 @@ fn restore_due_at(state: &AgentRuntimeState, now_ms: u64) -> bool {
 
 fn load_agent_config(path: &std::path::Path) -> Result<AppConfig, String> {
     if path.exists() {
-        return ConfigStore::load(path).map_err(|error| error.to_string());
+        return ConfigStore::load_with_backup(path).map_err(|error| error.to_string());
     }
     Ok(AppConfig::default())
 }

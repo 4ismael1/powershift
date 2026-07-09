@@ -1,5 +1,6 @@
 pub mod autostart;
 pub mod error;
+#[cfg(feature = "icons")]
 pub mod icon;
 pub mod identity;
 pub mod ipc_events;
@@ -21,6 +22,7 @@ pub use autostart::{
     TRAY_AUTOSTART_VALUE_NAME,
 };
 pub use error::{PowerError, PowerResult};
+#[cfg(feature = "icons")]
 pub use icon::{png_data_url, png_data_url_from_executable};
 pub use identity::current_user_sid_string;
 pub use ipc_events::{

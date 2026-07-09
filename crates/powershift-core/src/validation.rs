@@ -1,6 +1,9 @@
 use crate::{AppConfig, MatchMode, RestoreBehavior};
 use std::collections::HashSet;
 
+const MAX_PROFILES: usize = 512;
+const MAX_ASSOCIATED_PROCESSES_PER_PROFILE: usize = 128;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidationIssue {
     pub code: ValidationCode,
@@ -21,6 +24,8 @@ impl ValidationIssue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationCode {
     UnsupportedVersion,
+    TooManyProfiles,
+    TooManyAssociatedProcesses,
     DuplicateProfileId,
     EmptyProfileId,
     EmptyProfileName,
@@ -42,6 +47,14 @@ pub fn validate_config(config: &AppConfig) -> Vec<ValidationIssue> {
             ValidationCode::UnsupportedVersion,
             "version",
             "config version must be at least 1",
+        ));
+    }
+
+    if config.profiles.len() > MAX_PROFILES {
+        issues.push(ValidationIssue::new(
+            ValidationCode::TooManyProfiles,
+            "profiles",
+            format!("config cannot contain more than {MAX_PROFILES} profiles"),
         ));
     }
 
@@ -113,6 +126,16 @@ pub fn validate_config(config: &AppConfig) -> Vec<ValidationIssue> {
                 ValidationCode::InvalidPriority,
                 format!("{base}.power.priority"),
                 "profile priority must be between 0 and 100",
+            ));
+        }
+
+        if profile.associated_processes.len() > MAX_ASSOCIATED_PROCESSES_PER_PROFILE {
+            issues.push(ValidationIssue::new(
+                ValidationCode::TooManyAssociatedProcesses,
+                format!("{base}.associated_processes"),
+                format!(
+                    "profile cannot contain more than {MAX_ASSOCIATED_PROCESSES_PER_PROFILE} associated processes"
+                ),
             ));
         }
 
@@ -288,5 +311,30 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.code == ValidationCode::InvalidCloseDelay));
+    }
+
+    #[test]
+    fn rejects_unbounded_profile_and_matcher_collections() {
+        let mut too_many_profiles = AppConfig::default();
+        for index in 0..=MAX_PROFILES {
+            too_many_profiles.profiles.push(Profile::new(
+                format!("profile-{index}"),
+                format!("Profile {index}"),
+                format!("game-{index}.exe"),
+                "balanced",
+            ));
+        }
+        assert!(validate_config(&too_many_profiles)
+            .iter()
+            .any(|issue| issue.code == ValidationCode::TooManyProfiles));
+
+        let mut too_many_matchers = valid_config();
+        too_many_matchers.profiles[0].associated_processes = (0
+            ..=MAX_ASSOCIATED_PROCESSES_PER_PROFILE)
+            .map(|index| ProcessMatcher::by_name(format!("helper-{index}.exe")))
+            .collect();
+        assert!(validate_config(&too_many_matchers)
+            .iter()
+            .any(|issue| issue.code == ValidationCode::TooManyAssociatedProcesses));
     }
 }

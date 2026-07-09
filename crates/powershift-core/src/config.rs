@@ -2,12 +2,15 @@ use crate::{validate_config, write_file_atomically, AppConfig, CURRENT_CONFIG_VE
 use std::fmt::{Display, Formatter};
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+pub const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 
 pub struct ConfigStore;
 
 impl ConfigStore {
     pub fn from_json_str(input: &str) -> Result<AppConfig, ConfigError> {
+        ensure_config_size(input.len())?;
         let config: AppConfig =
             serde_json::from_str(strip_utf8_bom(input)).map_err(ConfigError::Json)?;
         let config = migrate_config(config);
@@ -24,18 +27,88 @@ impl ConfigStore {
         if !issues.is_empty() {
             return Err(ConfigError::Validation(issues.len()));
         }
-        serde_json::to_string_pretty(config).map_err(ConfigError::Json)
+        let json = serde_json::to_string_pretty(config).map_err(ConfigError::Json)?;
+        ensure_config_size(json.len())?;
+        Ok(json)
     }
 
     pub fn load(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> {
+        let path = path.as_ref();
+        let bytes = fs::metadata(path).map_err(ConfigError::Io)?.len();
+        if bytes > MAX_CONFIG_BYTES as u64 {
+            return Err(ConfigError::TooLarge {
+                bytes: bytes.try_into().unwrap_or(usize::MAX),
+                max: MAX_CONFIG_BYTES,
+            });
+        }
         let input = fs::read_to_string(path).map_err(ConfigError::Io)?;
         Self::from_json_str(&input)
     }
 
-    pub fn save(path: impl AsRef<Path>, config: &AppConfig) -> Result<(), ConfigError> {
-        let json = Self::to_pretty_json(config)?;
-        write_file_atomically(path.as_ref(), json.as_bytes()).map_err(ConfigError::Io)
+    pub fn load_recovering(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> {
+        let path = path.as_ref();
+        match Self::load(path) {
+            Ok(config) => Ok(config),
+            Err(primary_error) => {
+                let backup = config_backup_path(path);
+                let config = Self::load(&backup).map_err(|_| primary_error)?;
+                let json = Self::to_pretty_json(&config)?;
+                write_file_atomically(path, json.as_bytes()).map_err(ConfigError::Io)?;
+                Ok(config)
+            }
+        }
     }
+
+    pub fn load_with_backup(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> {
+        let path = path.as_ref();
+        match Self::load(path) {
+            Ok(config) => Ok(config),
+            Err(primary_error) => Self::load(config_backup_path(path)).map_err(|_| primary_error),
+        }
+    }
+
+    pub fn save(path: impl AsRef<Path>, config: &AppConfig) -> Result<(), ConfigError> {
+        let path = path.as_ref();
+        let json = Self::to_pretty_json(config)?;
+        preserve_valid_config_backup(path)?;
+        write_file_atomically(path, json.as_bytes()).map_err(ConfigError::Io)
+    }
+}
+
+fn ensure_config_size(bytes: usize) -> Result<(), ConfigError> {
+    if bytes <= MAX_CONFIG_BYTES {
+        Ok(())
+    } else {
+        Err(ConfigError::TooLarge {
+            bytes,
+            max: MAX_CONFIG_BYTES,
+        })
+    }
+}
+
+fn config_backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".bak");
+    PathBuf::from(backup)
+}
+
+fn preserve_valid_config_backup(path: &Path) -> Result<(), ConfigError> {
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let existing = match fs::read(path) {
+        Ok(existing) if existing.len() <= MAX_CONFIG_BYTES => existing,
+        _ => return Ok(()),
+    };
+    let Ok(text) = std::str::from_utf8(&existing) else {
+        return Ok(());
+    };
+    if ConfigStore::from_json_str(text).is_err() {
+        return Ok(());
+    }
+
+    write_file_atomically(config_backup_path(path), &existing).map_err(ConfigError::Io)
 }
 
 fn strip_utf8_bom(input: &str) -> &str {
@@ -61,6 +134,7 @@ pub enum ConfigError {
     Io(io::Error),
     Json(serde_json::Error),
     Validation(usize),
+    TooLarge { bytes: usize, max: usize },
 }
 
 impl Display for ConfigError {
@@ -70,6 +144,9 @@ impl Display for ConfigError {
             ConfigError::Json(err) => write!(f, "Invalid config JSON: {err}"),
             ConfigError::Validation(count) => {
                 write!(f, "Config failed validation with {count} issue(s)")
+            }
+            ConfigError::TooLarge { bytes, max } => {
+                write!(f, "Config is too large: {bytes} bytes (maximum {max})")
             }
         }
     }
@@ -222,5 +299,62 @@ mod tests {
                 .to_string_lossy()
                 .starts_with(&format!("{stem}.tmp-"))));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rejects_config_larger_than_the_bounded_runtime_contract() {
+        let oversized = " ".repeat(MAX_CONFIG_BYTES + 1);
+
+        let error = ConfigStore::from_json_str(&oversized).expect_err("oversized config");
+
+        assert!(matches!(error, ConfigError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn recovers_the_last_valid_config_after_primary_corruption() {
+        let path = std::env::temp_dir().join(format!(
+            "powershift-core-config-recovery-{}.json",
+            std::process::id()
+        ));
+        let backup = config_backup_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&backup);
+
+        let first = valid_config();
+        ConfigStore::save(&path, &first).expect("first save");
+        let mut second = first.clone();
+        second.profiles[0].name = "Updated profile".to_string();
+        ConfigStore::save(&path, &second).expect("second save");
+        fs::write(&path, []).expect("truncate primary");
+
+        let recovered = ConfigStore::load_recovering(&path).expect("recover backup");
+
+        assert_eq!(recovered, first);
+        assert_eq!(ConfigStore::load(&path).expect("restored primary"), first);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn read_only_backup_fallback_does_not_rewrite_the_primary_config() {
+        let path = std::env::temp_dir().join(format!(
+            "powershift-core-config-readonly-recovery-{}.json",
+            std::process::id()
+        ));
+        let backup = config_backup_path(&path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&backup);
+
+        let config = valid_config();
+        let json = ConfigStore::to_pretty_json(&config).expect("serialize backup");
+        fs::write(&path, []).expect("empty primary");
+        fs::write(&backup, json).expect("write backup");
+
+        let loaded = ConfigStore::load_with_backup(&path).expect("fallback to backup");
+
+        assert_eq!(loaded, config);
+        assert_eq!(fs::read(&path).expect("read primary"), Vec::<u8>::new());
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(&backup);
     }
 }

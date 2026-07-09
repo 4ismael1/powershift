@@ -18,9 +18,9 @@ pub fn default_config_path() -> PathBuf {
 
 pub fn load_or_create_config(path: PathBuf) -> Result<AppConfig, String> {
     if path.exists() {
+        let config = ConfigStore::load_recovering(&path).map_err(|error| error.to_string())?;
         let input = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
         let file_version = config_version_from_json(&input);
-        let config = ConfigStore::from_json_str(&input).map_err(|error| error.to_string())?;
 
         if should_persist_loaded_config(file_version, &config) {
             save_config_to_path(path, &config)?;

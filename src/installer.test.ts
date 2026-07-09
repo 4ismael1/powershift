@@ -62,7 +62,9 @@ describe('installer background architecture', () => {
     expect(preUninstall).toContain('Sleep 1200');
     expect(preUninstall).toContain('RMDir /r "$APPDATA\\PowerShift"');
     expect(preUninstall).toContain('RMDir /r "$LOCALAPPDATA\\com.powershift.desktop"');
-    expect(preUninstall).toContain('RMDir /r "$PROGRAMDATA\\PowerShift"');
+    expect(preUninstall).toContain('WindowsIdentity]::GetCurrent().User.Value');
+    expect(preUninstall).toContain('Remove-Item -LiteralPath $$runtime -Recurse');
+    expect(preUninstall).not.toContain('RMDir /r "$PROGRAMDATA\\PowerShift"');
     expect(preUninstall).toContain('Delete "$TEMP\\powershift-exe-icon.png"');
   });
 });
