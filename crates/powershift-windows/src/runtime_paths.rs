@@ -57,6 +57,27 @@ fn validate_sid_component(sid: &str) -> PowerResult<()> {
 
 #[cfg(windows)]
 fn prepare_runtime_directory(runtime_dir: &Path) -> PowerResult<()> {
+    let layout = runtime_directory_layout(runtime_dir)?;
+    let descriptor = runtime_directory_security_descriptor(&layout.user_sid);
+
+    // Parent directories are shared by every Windows account using PowerShift.
+    // Giving either parent a per-user protected DACL would make the last user
+    // that starts the agent lock out every other account. Only the SID-scoped
+    // leaf contains private runtime data and receives the protected ACL.
+    ensure_plain_directory(&layout.product_dir)?;
+    ensure_plain_directory(&layout.users_dir)?;
+    secure_directory(&layout.private_dir, &descriptor)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeDirectoryLayout {
+    product_dir: PathBuf,
+    users_dir: PathBuf,
+    private_dir: PathBuf,
+    user_sid: String,
+}
+
+fn runtime_directory_layout(runtime_dir: &Path) -> PowerResult<RuntimeDirectoryLayout> {
     let user_sid = runtime_dir
         .file_name()
         .and_then(|value| value.to_str())
@@ -68,25 +89,18 @@ fn prepare_runtime_directory(runtime_dir: &Path) -> PowerResult<()> {
     let product_dir = users_dir
         .parent()
         .ok_or_else(|| PowerError::Parse("runtime directory has no product parent".to_string()))?;
-    let descriptor = runtime_directory_security_descriptor(user_sid);
 
-    secure_directory(product_dir, &descriptor)?;
-    secure_directory(users_dir, &descriptor)?;
-    secure_directory(runtime_dir, &descriptor)
+    Ok(RuntimeDirectoryLayout {
+        product_dir: product_dir.to_path_buf(),
+        users_dir: users_dir.to_path_buf(),
+        private_dir: runtime_dir.to_path_buf(),
+        user_sid: user_sid.to_string(),
+    })
 }
 
 #[cfg(windows)]
-fn secure_directory(path: &Path, sddl: &str) -> PowerResult<()> {
+fn ensure_plain_directory(path: &Path) -> PowerResult<()> {
     use std::os::windows::fs::MetadataExt;
-    use windows::core::HSTRING;
-    use windows::Win32::Foundation::{LocalFree, HLOCAL};
-    use windows::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-    };
-    use windows::Win32::Security::{
-        SetFileSecurityW, DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION,
-        PSECURITY_DESCRIPTOR,
-    };
     use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
 
     match std::fs::create_dir(path) {
@@ -102,6 +116,23 @@ fn secure_directory(path: &Path, sddl: &str) -> PowerResult<()> {
             path.display()
         )));
     }
+
+    Ok(())
+}
+
+#[cfg(windows)]
+fn secure_directory(path: &Path, sddl: &str) -> PowerResult<()> {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::{LocalFree, HLOCAL};
+    use windows::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows::Win32::Security::{
+        SetFileSecurityW, DACL_SECURITY_INFORMATION, LABEL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR,
+    };
+
+    ensure_plain_directory(path)?;
 
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     unsafe {
@@ -178,6 +209,22 @@ mod tests {
         assert!(descriptor.contains(";;;S-1-5-21-1000"));
         assert!(descriptor.contains("NW;;;HI"));
         assert!(!descriptor.contains(";;;IU"));
+    }
+
+    #[test]
+    fn runtime_layout_keeps_shared_parents_separate_from_private_user_directories() {
+        let first =
+            runtime_directory_layout(Path::new(r"C:\ProgramData\PowerShift\users\S-1-5-21-1000"))
+                .expect("first layout");
+        let second =
+            runtime_directory_layout(Path::new(r"C:\ProgramData\PowerShift\users\S-1-5-21-2000"))
+                .expect("second layout");
+
+        assert_eq!(first.product_dir, second.product_dir);
+        assert_eq!(first.users_dir, second.users_dir);
+        assert_ne!(first.private_dir, second.private_dir);
+        assert_eq!(first.user_sid, "S-1-5-21-1000");
+        assert_eq!(second.user_sid, "S-1-5-21-2000");
     }
 
     #[test]

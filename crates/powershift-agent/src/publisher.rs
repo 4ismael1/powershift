@@ -341,8 +341,7 @@ fn publish_state_best_effort_with_shared(
         shared_state.set(state.clone());
     }
     publish_state_best_effort(path, state);
-    let _ =
-        powershift_windows::signal_ipc_event(powershift_windows::AGENT_STATE_UPDATED_EVENT_NAME);
+    powershift_windows::signal_agent_state_updated();
 }
 
 fn rotate_event_log_if_needed(path: &PathBuf) -> Result<(), String> {

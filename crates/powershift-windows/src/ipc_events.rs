@@ -4,7 +4,8 @@ pub const UI_SHOW_EVENT_NAME: &str = "Local\\PowerShiftUiShow";
 pub const UI_EXIT_EVENT_NAME: &str = "Local\\PowerShiftUiExit";
 pub const TRAY_QUIT_EVENT_NAME: &str = "Local\\PowerShiftTrayQuit";
 pub const EVENT_LOG_UPDATED_EVENT_NAME: &str = "Local\\PowerShiftEventLogUpdated";
-pub const AGENT_STATE_UPDATED_EVENT_NAME: &str = "Local\\PowerShiftAgentStateUpdated";
+pub const AGENT_STATE_UPDATED_UI_EVENT_NAME: &str = "Local\\PowerShiftAgentStateUpdatedUi";
+pub const AGENT_STATE_UPDATED_TRAY_EVENT_NAME: &str = "Local\\PowerShiftAgentStateUpdatedTray";
 
 #[cfg(windows)]
 pub type EventHandle = windows::Win32::Foundation::HANDLE;
@@ -63,6 +64,14 @@ pub fn signal_ipc_event(_name: &str) -> PowerResult<()> {
     Err(crate::PowerError::NotSupported("Windows IPC events"))
 }
 
+/// Broadcasts a state invalidation to every resident consumer. Win32
+/// auto-reset events wake only one waiter, so the UI and tray intentionally use
+/// distinct event objects instead of competing for a shared signal.
+pub fn signal_agent_state_updated() {
+    let _ = signal_ipc_event(AGENT_STATE_UPDATED_UI_EVENT_NAME);
+    let _ = signal_ipc_event(AGENT_STATE_UPDATED_TRAY_EVENT_NAME);
+}
+
 #[cfg(not(windows))]
 pub fn wait_for_ipc_event(_handle: ()) -> PowerResult<()> {
     Err(crate::PowerError::NotSupported("Windows IPC events"))
@@ -78,6 +87,11 @@ mod tests {
         assert!(UI_EXIT_EVENT_NAME.starts_with("Local\\"));
         assert!(TRAY_QUIT_EVENT_NAME.starts_with("Local\\"));
         assert!(EVENT_LOG_UPDATED_EVENT_NAME.starts_with("Local\\"));
-        assert!(AGENT_STATE_UPDATED_EVENT_NAME.starts_with("Local\\"));
+        assert!(AGENT_STATE_UPDATED_UI_EVENT_NAME.starts_with("Local\\"));
+        assert!(AGENT_STATE_UPDATED_TRAY_EVENT_NAME.starts_with("Local\\"));
+        assert_ne!(
+            AGENT_STATE_UPDATED_UI_EVENT_NAME,
+            AGENT_STATE_UPDATED_TRAY_EVENT_NAME
+        );
     }
 }

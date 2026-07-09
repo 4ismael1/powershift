@@ -35,7 +35,7 @@ pub fn configure_windowing<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> 
 fn start_agent_state_listener<R: Runtime>(app: AppHandle<R>) {
     std::thread::spawn(move || {
         let Ok(handle) = powershift_windows::create_ipc_event(
-            powershift_windows::AGENT_STATE_UPDATED_EVENT_NAME,
+            powershift_windows::AGENT_STATE_UPDATED_UI_EVENT_NAME,
         ) else {
             return;
         };
@@ -241,7 +241,7 @@ mod tests {
     fn agent_state_changes_are_forwarded_to_the_webview() {
         let source = include_str!("windowing.rs");
 
-        assert!(source.contains("AGENT_STATE_UPDATED_EVENT_NAME"));
+        assert!(source.contains("AGENT_STATE_UPDATED_UI_EVENT_NAME"));
         assert!(source.contains("powershift://agent-state-changed"));
         assert!(source.contains("app.emit"));
     }

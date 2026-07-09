@@ -24,7 +24,8 @@ pub use error::{PowerError, PowerResult};
 pub use icon::{png_data_url, png_data_url_from_executable};
 pub use identity::current_user_sid_string;
 pub use ipc_events::{
-    create_ipc_event, signal_ipc_event, wait_for_ipc_event, AGENT_STATE_UPDATED_EVENT_NAME,
+    create_ipc_event, signal_agent_state_updated, signal_ipc_event, wait_for_ipc_event,
+    AGENT_STATE_UPDATED_TRAY_EVENT_NAME, AGENT_STATE_UPDATED_UI_EVENT_NAME,
     EVENT_LOG_UPDATED_EVENT_NAME, TRAY_QUIT_EVENT_NAME, UI_EXIT_EVENT_NAME, UI_SHOW_EVENT_NAME,
 };
 pub use manager::{PowerManager, PowerManagerBackend};

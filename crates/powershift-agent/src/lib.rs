@@ -1,30 +1,40 @@
-use powershift_core::{
-    process_matches_enabled_profile, resolve_active_profiles, ActiveProfile, AgentStatus,
-    AppConfig, ConfigStore, DetectedProcess, ProcessInfo, RestoreBehavior,
-};
+use powershift_core::{AgentStatus, AppConfig, ConfigStore};
+mod engine;
 mod ipc;
+mod model;
 mod paths;
 mod process_registry;
+mod process_runtime;
 mod publisher;
 mod scheduler;
 
+pub use engine::evaluate_agent_scan_stateful;
 pub use ipc::{
     request_agent_clear_events_via_ipc, request_agent_reevaluate_via_ipc,
     request_agent_shutdown_via_ipc, request_agent_status_via_ipc, AgentIpcRequest,
     AgentIpcResponse,
 };
+pub use model::{
+    AgentActiveProfile, AgentRuntimeState, AgentScanResult, PendingRestoreState,
+    ProcessTrackingStatus, PublishedAgentState, WmiWatcherChannelStatus, WmiWatcherState,
+    WmiWatcherStatus,
+};
 pub use paths::AgentPaths;
 pub use publisher::{append_event_to_path, publish_state, EventLogEntry};
 
+use engine::evaluate_agent_processes_stateful;
 #[cfg(test)]
 use ipc::handle_agent_ipc_request;
 use ipc::{load_or_create_control_token, spawn_agent_ipc_server, AgentSharedState};
 use powershift_windows::{
     create_agent_wake_event, inspect_process, spawn_process_event_watchers, wait_for_agent_wake,
-    ObservedProcess, PowerManager, PowerManagerBackend, ProcessInstanceId, ProcessSnapshotBackend,
-    ProcessWatchMessage, SystemProcessBackend,
+    PowerManager, PowerManagerBackend, ProcessSnapshotBackend, ProcessWatchMessage,
+    SystemProcessBackend,
 };
-use process_registry::{ProcessExitWatchSet, ProcessRegistry, TrackedProcess};
+use process_registry::{ProcessExitWatchSet, ProcessRegistry};
+#[cfg(test)]
+use process_runtime::apply_observed_stop;
+use process_runtime::{apply_observed_start, apply_process_event, tracked_process_from_snapshot};
 #[cfg(test)]
 use publisher::{
     agent_error_message, publish_error, publish_heartbeat, publish_scan_outcome, scan_event_entry,
@@ -40,134 +50,10 @@ use scheduler::{
     agent_wake_event, is_agent_wake_event, next_wait_with_scheduler, AgentScanScheduler,
     AgentWatchSet, TargetedInspectionQueue,
 };
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
 const AGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentScanResult {
-    pub matched_profile_id: Option<String>,
-    pub matched_profile_name: Option<String>,
-    pub target_plan_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restore_profile_name: Option<String>,
-    #[serde(default)]
-    pub active_profiles: Vec<AgentActiveProfile>,
-    pub changed_power_plan: bool,
-    pub restore_scheduled: bool,
-    pub restored_power_plan: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AgentActiveProfile {
-    pub profile_id: String,
-    pub profile_name: String,
-    pub plan_id: String,
-    pub priority: u8,
-    pub matched_processes: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct AgentRuntimeState {
-    pub active_profile_ids: Vec<String>,
-    pub winning_profile_id: Option<String>,
-    pub previous_plan_id: Option<String>,
-    pub pending_restore: Option<PendingRestoreState>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingRestoreState {
-    pub due_at_ms: u64,
-    pub plan_id: String,
-    pub profile_id: String,
-    pub profile_name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PublishedAgentState {
-    pub pid: u32,
-    pub status: AgentStatus,
-    pub updated_at_ms: u64,
-    pub last_scan: Option<AgentScanResult>,
-    pub last_error: Option<String>,
-    #[serde(default)]
-    pub process_tracking: ProcessTrackingStatus,
-    #[serde(default)]
-    pub wmi_watchers: WmiWatcherStatus,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ProcessTrackingStatus {
-    pub tracked_instances: u32,
-    pub registered_exit_waits: u32,
-    pub unavailable_exit_waits: u32,
-    pub pending_targeted_inspections: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WmiWatcherState {
-    #[default]
-    Starting,
-    Running,
-    Degraded,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct WmiWatcherChannelStatus {
-    pub state: WmiWatcherState,
-    pub last_transition_ms: u64,
-    pub retry_in_ms: Option<u64>,
-    pub last_error: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct WmiWatcherStatus {
-    pub starts: WmiWatcherChannelStatus,
-    pub stops: WmiWatcherChannelStatus,
-}
-
-impl WmiWatcherStatus {
-    fn mark_healthy(&mut self, kind: powershift_windows::ProcessWatcherKind, now_ms: u64) {
-        let channel = self.channel_mut(kind);
-        channel.state = WmiWatcherState::Running;
-        channel.last_transition_ms = now_ms;
-        channel.retry_in_ms = None;
-        channel.last_error = None;
-    }
-
-    fn mark_degraded(
-        &mut self,
-        kind: powershift_windows::ProcessWatcherKind,
-        error: String,
-        retry_in_ms: u64,
-        now_ms: u64,
-    ) {
-        let channel = self.channel_mut(kind);
-        channel.state = WmiWatcherState::Degraded;
-        channel.last_transition_ms = now_ms;
-        channel.retry_in_ms = Some(retry_in_ms);
-        channel.last_error = Some(error);
-    }
-
-    fn is_degraded(&self) -> bool {
-        self.starts.state == WmiWatcherState::Degraded
-            || self.stops.state == WmiWatcherState::Degraded
-    }
-
-    fn channel_mut(
-        &mut self,
-        kind: powershift_windows::ProcessWatcherKind,
-    ) -> &mut WmiWatcherChannelStatus {
-        match kind {
-            powershift_windows::ProcessWatcherKind::Starts => &mut self.starts,
-            powershift_windows::ProcessWatcherKind::Stops => &mut self.stops,
-        }
-    }
-}
 
 fn synchronize_watcher_health(
     watcher_health: &WmiWatcherStatus,
@@ -179,9 +65,7 @@ fn synchronize_watcher_health(
         if state.wmi_watchers != *watcher_health {
             state.wmi_watchers = watcher_health.clone();
             shared_state.set(state);
-            let _ = powershift_windows::signal_ipc_event(
-                powershift_windows::AGENT_STATE_UPDATED_EVENT_NAME,
-            );
+            powershift_windows::signal_agent_state_updated();
         }
     }
 }
@@ -648,313 +532,6 @@ where
     result
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct ProcessEventApplication {
-    changed: bool,
-    deferred_inspection: Option<(u32, String)>,
-}
-
-fn apply_process_event(
-    event: &powershift_windows::ProcessEvent,
-    config: &AppConfig,
-    watch_set: &AgentWatchSet,
-    registry: &mut ProcessRegistry,
-) -> ProcessEventApplication {
-    match event.kind {
-        powershift_windows::ProcessEventKind::Started => {
-            if !watch_set.should_observe(&event.name) {
-                return ProcessEventApplication::default();
-            }
-            let Some(observed) = inspect_process(event.pid, &event.name) else {
-                return ProcessEventApplication {
-                    changed: false,
-                    deferred_inspection: (event.pid != 0).then(|| (event.pid, event.name.clone())),
-                };
-            };
-            ProcessEventApplication {
-                changed: apply_observed_start(config, watch_set, registry, observed),
-                deferred_inspection: None,
-            }
-        }
-        powershift_windows::ProcessEventKind::Stopped => {
-            let current = inspect_process(event.pid, &event.name);
-            ProcessEventApplication {
-                changed: apply_observed_stop(config, watch_set, registry, event.pid, current),
-                deferred_inspection: None,
-            }
-        }
-    }
-}
-
-fn apply_observed_start(
-    config: &AppConfig,
-    watch_set: &AgentWatchSet,
-    registry: &mut ProcessRegistry,
-    observed: ObservedProcess,
-) -> bool {
-    tracked_process_from_observed(config, watch_set, observed)
-        .is_some_and(|process| registry.upsert(process))
-}
-
-fn apply_observed_stop(
-    config: &AppConfig,
-    watch_set: &AgentWatchSet,
-    registry: &mut ProcessRegistry,
-    pid: u32,
-    current: Option<ObservedProcess>,
-) -> bool {
-    let current_instance = current.as_ref().map(|process| &process.instance);
-    let mut changed = registry.remove_stopped_pid(pid, current_instance);
-    if let Some(process) =
-        current.and_then(|process| tracked_process_from_observed(config, watch_set, process))
-    {
-        changed |= registry.upsert(process);
-    }
-    changed
-}
-
-fn tracked_process_from_snapshot(
-    config: &AppConfig,
-    watch_set: &AgentWatchSet,
-    process: ProcessInfo,
-) -> Option<TrackedProcess> {
-    if !watch_set.should_observe(&process.name) {
-        return None;
-    }
-
-    let observed = inspect_process(process.pid, &process.name).unwrap_or(ObservedProcess {
-        instance: ProcessInstanceId {
-            pid: process.pid,
-            creation_time: 0,
-        },
-        process,
-        session_id: None,
-    });
-    tracked_process_from_observed(config, watch_set, observed)
-}
-
-fn tracked_process_from_observed(
-    config: &AppConfig,
-    watch_set: &AgentWatchSet,
-    observed: ObservedProcess,
-) -> Option<TrackedProcess> {
-    if observed.session_id == Some(0) {
-        return None;
-    }
-    if !watch_set.should_observe(&observed.process.name) {
-        return None;
-    }
-    let process = DetectedProcess {
-        pid: observed.process.pid,
-        name: observed.process.name,
-        path: observed.process.path,
-    };
-    process_matches_enabled_profile(config, &process)
-        .then(|| TrackedProcess::new(observed.instance, process))
-}
-
-pub fn evaluate_agent_scan_stateful<P, W>(
-    config: &AppConfig,
-    process_backend: &P,
-    power_backend: &W,
-    state: &mut AgentRuntimeState,
-    now_ms: u64,
-) -> Result<AgentScanResult, String>
-where
-    P: ProcessSnapshotBackend,
-    W: PowerManagerBackend,
-{
-    let processes = process_backend
-        .list_processes()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .map(|process| DetectedProcess {
-            pid: process.pid,
-            name: process.name,
-            path: process.path,
-        })
-        .collect::<Vec<_>>();
-    evaluate_agent_processes_stateful(config, &processes, power_backend, state, now_ms)
-}
-
-fn evaluate_agent_processes_stateful<W>(
-    config: &AppConfig,
-    processes: &[DetectedProcess],
-    power_backend: &W,
-    state: &mut AgentRuntimeState,
-    now_ms: u64,
-) -> Result<AgentScanResult, String>
-where
-    W: PowerManagerBackend,
-{
-    let active_plan = power_backend
-        .active_plan()
-        .map_err(|error| error.to_string())?;
-
-    let active_profiles = resolve_active_profiles(config, processes);
-
-    if let Some(winner) =
-        choose_winning_profile(&active_profiles, state.winning_profile_id.as_deref())
-    {
-        if state.active_profile_ids.is_empty() && state.pending_restore.is_none() {
-            state.previous_plan_id = Some(active_plan.id.clone());
-        }
-        state.active_profile_ids = active_profiles
-            .iter()
-            .map(|profile| profile.profile_id.clone())
-            .collect();
-        state.winning_profile_id = Some(winner.profile_id.clone());
-        state.pending_restore = None;
-
-        let changed_power_plan = active_plan.id != winner.plan_id;
-        if changed_power_plan {
-            power_backend
-                .set_active_plan(&winner.plan_id)
-                .map_err(|error| error.to_string())?;
-        }
-
-        return Ok(AgentScanResult {
-            matched_profile_id: Some(winner.profile_id.clone()),
-            matched_profile_name: Some(winner.name.clone()),
-            target_plan_id: Some(winner.plan_id.clone()),
-            restore_profile_name: None,
-            active_profiles: active_profiles
-                .iter()
-                .map(AgentActiveProfile::from)
-                .collect(),
-            changed_power_plan,
-            restore_scheduled: false,
-            restored_power_plan: false,
-        });
-    }
-
-    state.active_profile_ids.clear();
-
-    if let Some(restore) = state.pending_restore.clone() {
-        if now_ms >= restore.due_at_ms {
-            let changed_power_plan = active_plan.id != restore.plan_id;
-            if changed_power_plan {
-                power_backend
-                    .set_active_plan(&restore.plan_id)
-                    .map_err(|error| error.to_string())?;
-            }
-            state.pending_restore = None;
-            state.previous_plan_id = None;
-            return Ok(AgentScanResult {
-                matched_profile_id: None,
-                matched_profile_name: None,
-                target_plan_id: Some(restore.plan_id),
-                restore_profile_name: Some(restore.profile_name),
-                active_profiles: Vec::new(),
-                changed_power_plan,
-                restore_scheduled: false,
-                restored_power_plan: true,
-            });
-        }
-    }
-
-    if let Some(profile_id) = state.winning_profile_id.take() {
-        if let Some(profile) = config
-            .profiles
-            .iter()
-            .find(|profile| profile.id == profile_id)
-        {
-            if let Some(plan_id) = restore_plan_for(profile, state.previous_plan_id.as_deref()) {
-                state.pending_restore = Some(PendingRestoreState {
-                    due_at_ms: now_ms + u64::from(profile.power.close_delay_seconds) * 1000,
-                    plan_id,
-                    profile_id: profile.id.clone(),
-                    profile_name: profile.name.clone(),
-                });
-                return Ok(AgentScanResult {
-                    matched_profile_id: None,
-                    matched_profile_name: None,
-                    target_plan_id: None,
-                    restore_profile_name: Some(profile.name.clone()),
-                    active_profiles: Vec::new(),
-                    changed_power_plan: false,
-                    restore_scheduled: true,
-                    restored_power_plan: false,
-                });
-            }
-            state.previous_plan_id = None;
-        }
-    }
-
-    Ok(AgentScanResult {
-        matched_profile_id: None,
-        matched_profile_name: None,
-        target_plan_id: None,
-        restore_profile_name: None,
-        active_profiles: Vec::new(),
-        changed_power_plan: false,
-        restore_scheduled: false,
-        restored_power_plan: false,
-    })
-}
-
-impl From<&ActiveProfile> for AgentActiveProfile {
-    fn from(profile: &ActiveProfile) -> Self {
-        let mut seen_process_names = BTreeSet::new();
-        let matched_processes = profile
-            .matched_processes
-            .iter()
-            .filter_map(|process| {
-                let name = process.name.trim();
-                if name.is_empty() {
-                    return None;
-                }
-                if seen_process_names.insert(name.to_ascii_lowercase()) {
-                    Some(process.name.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-
-        Self {
-            profile_id: profile.profile_id.clone(),
-            profile_name: profile.name.clone(),
-            plan_id: profile.plan_id.clone(),
-            priority: profile.priority,
-            matched_processes,
-        }
-    }
-}
-
-fn choose_winning_profile<'a>(
-    active_profiles: &'a [ActiveProfile],
-    current_winner_id: Option<&str>,
-) -> Option<&'a ActiveProfile> {
-    let max_priority = active_profiles
-        .iter()
-        .map(|profile| profile.priority)
-        .max()?;
-
-    if let Some(current_winner_id) = current_winner_id {
-        if let Some(current) = active_profiles.iter().find(|profile| {
-            profile.profile_id == current_winner_id && profile.priority == max_priority
-        }) {
-            return Some(current);
-        }
-    }
-
-    active_profiles
-        .iter()
-        .find(|profile| profile.priority == max_priority)
-}
-
-fn restore_plan_for(
-    profile: &powershift_core::Profile,
-    previous_plan_id: Option<&str>,
-) -> Option<String> {
-    match profile.power.on_close_behavior {
-        RestoreBehavior::PreviousPlan => previous_plan_id.map(ToOwned::to_owned),
-        RestoreBehavior::SpecificPlan => profile.power.on_close_plan_id.clone(),
-        RestoreBehavior::DoNothing => None,
-    }
-}
-
 fn next_wait_at(state: &AgentRuntimeState, now_ms: u64) -> Duration {
     let restore_delay = state
         .pending_restore
@@ -995,9 +572,10 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use powershift_core::{PowerPlan, ProcessInfo, Profile};
-    use powershift_windows::{PowerError, PowerResult};
+    use powershift_core::{ActiveProfile, DetectedProcess, PowerPlan, ProcessInfo, Profile};
+    use powershift_windows::{ObservedProcess, PowerError, PowerResult, ProcessInstanceId};
     use std::cell::RefCell;
+    use std::collections::BTreeSet;
 
     struct FakeProcessBackend {
         processes: Vec<ProcessInfo>,

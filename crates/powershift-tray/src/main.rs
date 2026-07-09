@@ -583,7 +583,7 @@ mod tray {
         let hwnd_value = hwnd.0 as isize;
         std::thread::spawn(move || {
             let Ok(handle) = powershift_windows::create_ipc_event(
-                powershift_windows::AGENT_STATE_UPDATED_EVENT_NAME,
+                powershift_windows::AGENT_STATE_UPDATED_TRAY_EVENT_NAME,
             ) else {
                 return;
             };
