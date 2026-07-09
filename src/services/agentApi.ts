@@ -80,7 +80,8 @@ export function shouldAutoInstallElevatedAgent(
 
 export function isAgentStateStale(state: PublishedAgentState | null, now = Date.now()): boolean {
   if (!state) return false;
-  if (state.process_alive === true) return false;
+  if (state.ipc_connected === true) return false;
+  if (state.process_alive === false) return true;
   return now - state.updated_at_ms > AGENT_STATE_STALE_MS;
 }
 

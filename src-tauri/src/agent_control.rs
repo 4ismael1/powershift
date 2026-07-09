@@ -5,7 +5,6 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tauri::Manager;
 
-const TASK_NAME: &str = "PowerShiftAgent";
 const AGENT_EXE_NAME: &str = "powershift-agent.exe";
 const TASK_RESTART_COUNT: u8 = 3;
 const TASK_RESTART_INTERVAL_MINUTES: u8 = 1;
@@ -167,8 +166,9 @@ fn agent_error_requires_elevated_agent(error: &str) -> bool {
 
 #[allow(dead_code)]
 pub fn restart_agent_task() -> Result<(), String> {
+    let task_name = powershift_windows::agent_task_name().map_err(|error| error.to_string())?;
     let _ = quiet_command("schtasks")
-        .args(stop_agent_task_args())
+        .args(stop_agent_task_args(&task_name))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
@@ -177,8 +177,9 @@ pub fn restart_agent_task() -> Result<(), String> {
 }
 
 fn run_agent_task() -> Result<(), String> {
+    let task_name = powershift_windows::agent_task_name().map_err(|error| error.to_string())?;
     let status = quiet_command("schtasks")
-        .args(run_agent_task_args())
+        .args(run_agent_task_args(&task_name))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -213,19 +214,20 @@ fn wait_for_agent_ipc(timeout: Duration) -> Result<(), String> {
     ))
 }
 
-fn run_agent_task_args() -> [&'static str; 3] {
-    ["/Run", "/TN", TASK_NAME]
+fn run_agent_task_args(task_name: &str) -> [&str; 3] {
+    ["/Run", "/TN", task_name]
 }
 
 #[allow(dead_code)]
-fn stop_agent_task_args() -> [&'static str; 3] {
-    ["/End", "/TN", TASK_NAME]
+fn stop_agent_task_args(task_name: &str) -> [&str; 3] {
+    ["/End", "/TN", task_name]
 }
 
 #[tauri::command(rename_all = "snake_case")]
 pub fn agent_task_installed() -> Result<bool, String> {
+    let task_name = powershift_windows::agent_task_name().map_err(|error| error.to_string())?;
     let status = quiet_command("schtasks")
-        .args(["/Query", "/TN", TASK_NAME])
+        .args(["/Query", "/TN", &task_name])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -238,9 +240,10 @@ fn disable_agent_startup_trigger() -> Result<(), String> {
         return Ok(());
     }
 
-    let command = disable_agent_startup_trigger_powershell();
+    let task_name = powershift_windows::agent_task_name().map_err(|error| error.to_string())?;
+    let command = disable_agent_startup_trigger_powershell(&task_name);
     let status = quiet_command("powershell")
-        .args(elevated_powershell_args(command))
+        .args(elevated_powershell_args(&command))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -297,7 +300,10 @@ fn missing_agent_message(current_exe: &Path, resource_dir: Option<&Path>) -> Str
 }
 
 fn register_agent_task(agent_path: &Path) -> Result<(), String> {
-    let command = scheduled_task_registration_powershell(agent_path);
+    let user_sid =
+        powershift_windows::current_user_sid_string().map_err(|error| error.to_string())?;
+    let task_name = powershift_windows::agent_task_name_for_sid(&user_sid);
+    let command = scheduled_task_registration_powershell(agent_path, &task_name, &user_sid);
     let status = quiet_command("powershell")
         .args(elevated_powershell_args(&command))
         .stdin(Stdio::null())
@@ -314,7 +320,10 @@ fn register_agent_task(agent_path: &Path) -> Result<(), String> {
 }
 
 fn run_elevated_task_installer(agent_path: &Path) -> Result<(), String> {
-    let command = elevated_install_powershell(agent_path);
+    let user_sid =
+        powershift_windows::current_user_sid_string().map_err(|error| error.to_string())?;
+    let task_name = powershift_windows::agent_task_name_for_sid(&user_sid);
+    let command = elevated_install_powershell(agent_path, &task_name, &user_sid);
     let status = quiet_command("powershell")
         .args(elevated_powershell_args(&command))
         .stdin(Stdio::null())
@@ -330,11 +339,12 @@ fn run_elevated_task_installer(agent_path: &Path) -> Result<(), String> {
     }
 }
 
-fn elevated_install_powershell(agent_path: &Path) -> String {
-    let registration_script = scheduled_task_registration_powershell(agent_path);
+fn elevated_install_powershell(agent_path: &Path, task_name: &str, user_sid: &str) -> String {
+    let registration_script =
+        scheduled_task_registration_powershell(agent_path, task_name, user_sid);
     let startup_script = format!(
         "{registration_script}; \
-         Start-ScheduledTask -TaskName '{TASK_NAME}' -ErrorAction SilentlyContinue"
+         Start-ScheduledTask -TaskName '{task_name}' -ErrorAction SilentlyContinue"
     );
     let escaped_script = startup_script.replace('\'', "''");
     format!(
@@ -346,30 +356,37 @@ fn elevated_install_powershell(agent_path: &Path) -> String {
     )
 }
 
-fn scheduled_task_registration_powershell(agent_path: &Path) -> String {
+fn scheduled_task_registration_powershell(
+    agent_path: &Path,
+    task_name: &str,
+    user_sid: &str,
+) -> String {
     let escaped_path = agent_path.display().to_string().replace('\'', "''");
     format!(
         "$agentPath = '{escaped_path}'; \
          $action = New-ScheduledTaskAction -Execute $agentPath; \
          $trigger = New-ScheduledTaskTrigger -AtLogOn; \
          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount {TASK_RESTART_COUNT} -RestartInterval (New-TimeSpan -Minutes {TASK_RESTART_INTERVAL_MINUTES}); \
-         $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; \
+         $userSid = '{user_sid}'; \
+         $user = ([System.Security.Principal.SecurityIdentifier]$userSid).Translate([System.Security.Principal.NTAccount]).Value; \
          $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest; \
-         Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null"
+         Register-ScheduledTask -TaskName '{task_name}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null"
     )
 }
 
 #[cfg(test)]
-fn task_settings_probe_powershell() -> &'static str {
-    "$task = Get-ScheduledTask -TaskName 'PowerShiftAgent' -ErrorAction Stop; \
-     if ($task.Settings.DisallowStartIfOnBatteries -or $task.Settings.StopIfGoingOnBatteries -or -not $task.Settings.StartWhenAvailable -or $task.Settings.ExecutionTimeLimit -ne 'PT0S' -or $task.Settings.RestartCount -lt 3) { exit 2 }; \
-     exit 0"
+fn task_settings_probe_powershell(task_name: &str) -> String {
+    format!("$task = Get-ScheduledTask -TaskName '{task_name}' -ErrorAction Stop; \
+     if ($task.Settings.DisallowStartIfOnBatteries -or $task.Settings.StopIfGoingOnBatteries -or -not $task.Settings.StartWhenAvailable -or $task.Settings.ExecutionTimeLimit -ne 'PT0S' -or $task.Settings.RestartCount -lt 3) {{ exit 2 }}; \
+     exit 0")
 }
 
-fn disable_agent_startup_trigger_powershell() -> &'static str {
-    "$task = Get-ScheduledTask -TaskName 'PowerShiftAgent' -ErrorAction Stop; \
-     foreach ($trigger in $task.Triggers) { $trigger.Enabled = $false }; \
-     Set-ScheduledTask -TaskName 'PowerShiftAgent' -Trigger $task.Triggers | Out-Null"
+fn disable_agent_startup_trigger_powershell(task_name: &str) -> String {
+    format!(
+        "$task = Get-ScheduledTask -TaskName '{task_name}' -ErrorAction Stop; \
+     foreach ($trigger in $task.Triggers) {{ $trigger.Enabled = $false }}; \
+     Set-ScheduledTask -TaskName '{task_name}' -Trigger $task.Triggers | Out-Null"
+    )
 }
 
 fn elevated_powershell_args(command: &str) -> [&str; 7] {
@@ -421,11 +438,16 @@ fn agent_wake_retry_failed_message(first_error: &str, retry_error: &str) -> Stri
 mod tests {
     use super::*;
 
+    const TEST_USER_SID: &str = "S-1-5-21-1000";
+    const TEST_TASK_NAME: &str = "PowerShiftAgent-S-1-5-21-1000";
+
     #[test]
     fn scheduled_task_uses_highest_privileges_and_agent_path() {
-        let script = scheduled_task_registration_powershell(&PathBuf::from(
-            "C:\\PowerShift\\powershift-agent.exe",
-        ));
+        let script = scheduled_task_registration_powershell(
+            &PathBuf::from("C:\\PowerShift\\powershift-agent.exe"),
+            TEST_TASK_NAME,
+            TEST_USER_SID,
+        );
 
         assert!(script.contains("New-ScheduledTaskTrigger -AtLogOn"));
         assert!(script.contains("New-ScheduledTaskPrincipal"));
@@ -434,16 +456,24 @@ mod tests {
         assert!(script.contains("-ExecutionTimeLimit ([TimeSpan]::Zero)"));
         assert!(script.contains("-RestartCount 3"));
         assert!(script.contains("-RestartInterval (New-TimeSpan -Minutes 1)"));
+        assert!(script.contains(TEST_TASK_NAME));
+        assert!(script.contains(TEST_USER_SID));
+        assert!(script.contains("SecurityIdentifier"));
         assert!(!script.contains("New-TimeSpan -Days"));
     }
 
     #[test]
     fn scheduled_task_can_start_on_battery_without_killing_running_agent() {
-        let script = scheduled_task_registration_powershell(&PathBuf::from(
-            "C:\\PowerShift\\powershift-agent.exe",
-        ));
-        let elevated =
-            elevated_install_powershell(&PathBuf::from("C:\\PowerShift\\powershift-agent.exe"));
+        let script = scheduled_task_registration_powershell(
+            &PathBuf::from("C:\\PowerShift\\powershift-agent.exe"),
+            TEST_TASK_NAME,
+            TEST_USER_SID,
+        );
+        let elevated = elevated_install_powershell(
+            &PathBuf::from("C:\\PowerShift\\powershift-agent.exe"),
+            TEST_TASK_NAME,
+            TEST_USER_SID,
+        );
 
         assert!(script.contains("-AllowStartIfOnBatteries"));
         assert!(script.contains("-DontStopIfGoingOnBatteries"));
@@ -455,8 +485,14 @@ mod tests {
 
     #[test]
     fn normal_start_runs_task_without_ending_existing_agent() {
-        assert_eq!(run_agent_task_args(), ["/Run", "/TN", TASK_NAME]);
-        assert_eq!(stop_agent_task_args(), ["/End", "/TN", TASK_NAME]);
+        assert_eq!(
+            run_agent_task_args(TEST_TASK_NAME),
+            ["/Run", "/TN", TEST_TASK_NAME]
+        );
+        assert_eq!(
+            stop_agent_task_args(TEST_TASK_NAME),
+            ["/End", "/TN", TEST_TASK_NAME]
+        );
     }
 
     #[test]
@@ -483,7 +519,7 @@ mod tests {
 
     #[test]
     fn task_settings_probe_detects_legacy_battery_blockers() {
-        let probe = task_settings_probe_powershell();
+        let probe = task_settings_probe_powershell(TEST_TASK_NAME);
 
         assert!(probe.contains("DisallowStartIfOnBatteries"));
         assert!(probe.contains("StopIfGoingOnBatteries"));
@@ -496,7 +532,7 @@ mod tests {
 
     #[test]
     fn disabling_startup_disables_triggers_without_stopping_agent() {
-        let script = disable_agent_startup_trigger_powershell();
+        let script = disable_agent_startup_trigger_powershell(TEST_TASK_NAME);
 
         assert!(script.contains("$trigger.Enabled = $false"));
         assert!(script.contains("Set-ScheduledTask"));
@@ -633,8 +669,11 @@ mod tests {
 
     #[test]
     fn elevated_installer_uses_uac_runas() {
-        let script =
-            elevated_install_powershell(&PathBuf::from("C:\\PowerShift\\powershift-agent.exe"));
+        let script = elevated_install_powershell(
+            &PathBuf::from("C:\\PowerShift\\powershift-agent.exe"),
+            TEST_TASK_NAME,
+            TEST_USER_SID,
+        );
 
         assert!(script.contains("-Verb RunAs"));
         assert!(script.contains("-WindowStyle Hidden"));

@@ -156,37 +156,6 @@ pub(crate) fn publish_error_with_shared(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn publish_heartbeat(
-    paths: &AgentPaths,
-    memory: &AgentPublishMemory,
-) -> Result<(), String> {
-    publish_heartbeat_with_shared(paths, memory, None)
-}
-
-pub(crate) fn publish_heartbeat_with_shared(
-    _paths: &AgentPaths,
-    memory: &AgentPublishMemory,
-    shared_state: Option<&AgentSharedState>,
-) -> Result<(), String> {
-    if let Some(shared_state) = shared_state {
-        shared_state.set(PublishedAgentState {
-            pid: std::process::id(),
-            status: if memory.last_error.is_some() {
-                AgentStatus::Error
-            } else {
-                AgentStatus::Running
-            },
-            updated_at_ms: now_ms(),
-            last_scan: memory.last_scan.clone(),
-            last_error: memory.last_error.clone(),
-            process_tracking: memory.process_tracking.clone(),
-            wmi_watchers: memory.wmi_watchers.clone(),
-        });
-    }
-    Ok(())
-}
-
 pub(crate) fn scan_event_entry<W>(
     result: &Result<AgentScanResult, String>,
     power_backend: &W,

@@ -4,6 +4,12 @@ use std::process::{Command, Stdio};
 use tauri::{AppHandle, Manager};
 
 const TRAY_EXE_NAME: &str = "powershift-tray.exe";
+const LEGACY_RUNTIME_FILES: [&str; 4] = [
+    "agent-state.json",
+    "agent-control.token",
+    "events.jsonl",
+    "events.jsonl.1",
+];
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -17,6 +23,7 @@ pub fn default_config_path() -> PathBuf {
 }
 
 pub fn load_or_create_config(path: PathBuf) -> Result<AppConfig, String> {
+    cleanup_legacy_runtime_files(path.parent());
     if path.exists() {
         let config = ConfigStore::load_recovering(&path).map_err(|error| error.to_string())?;
         let input = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
@@ -32,6 +39,15 @@ pub fn load_or_create_config(path: PathBuf) -> Result<AppConfig, String> {
     let config = AppConfig::default();
     save_config_to_path(path, &config)?;
     Ok(config)
+}
+
+fn cleanup_legacy_runtime_files(config_dir: Option<&Path>) {
+    let Some(config_dir) = config_dir else {
+        return;
+    };
+    for file_name in LEGACY_RUNTIME_FILES {
+        let _ = std::fs::remove_file(config_dir.join(file_name));
+    }
 }
 
 fn config_version_from_json(input: &str) -> Option<u32> {
@@ -241,6 +257,32 @@ mod tests {
         assert_eq!(config, AppConfig::default());
         assert!(path.exists());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_load_removes_only_legacy_runtime_files() {
+        let directory = temp_config_path("legacy-runtime")
+            .parent()
+            .expect("temp parent")
+            .join(format!("powershift-legacy-runtime-{}", std::process::id()));
+        let config_path = directory.join("config.json");
+        std::fs::create_dir_all(&directory).expect("create temp directory");
+        std::fs::write(
+            &config_path,
+            ConfigStore::to_pretty_json(&AppConfig::default()).unwrap(),
+        )
+        .expect("seed config");
+        for file_name in LEGACY_RUNTIME_FILES {
+            std::fs::write(directory.join(file_name), b"legacy").expect("seed legacy file");
+        }
+
+        load_or_create_config(config_path.clone()).expect("load config");
+
+        assert!(config_path.exists());
+        for file_name in LEGACY_RUNTIME_FILES {
+            assert!(!directory.join(file_name).exists());
+        }
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]

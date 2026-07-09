@@ -56,20 +56,28 @@ PowerShift is split into three executables:
 | `powershift-agent.exe` | Lightweight Rust agent that watches process events and applies power plans. |
 | `powershift-tray.exe` | Tray icon, notifications, and UI launcher. |
 
-The UI is intentionally not the resident worker. When the window is closed or
-hidden, the agent and tray keep the automation alive without keeping the WebView
-open.
+The UI is intentionally not the resident worker. Closing the window terminates
+the Tauri/WebView process; the agent and tray keep automation alive and reopen a
+fresh UI only when requested.
 
 The elevated boundary is explicit: user configuration remains under
 `%APPDATA%\PowerShift`, while agent-owned state, diagnostics, and control data
 live under `%ProgramData%\PowerShift\users\<SID>`. The runtime directory uses a
 high-integrity ACL, and the session-local named pipe is restricted to the exact
-Windows user SID with bounded request size and read time. The scheduled task has
-no 72-hour execution cutoff and retries a limited number of unexpected failures.
+Windows user SID with bounded request size and read time. Each Windows account
+gets a SID-scoped scheduled task, with no 72-hour execution cutoff and a bounded
+restart policy.
 
-Agent state changes wake the tray and an open UI through native events. A slow
-UI reconciliation timer remains only as a safety net; the resident tray no
-longer polls the agent or active power plan every 15 seconds.
+Agent state changes wake the tray and an open UI through separate native events,
+so the consumers cannot steal notifications from one another. Liveness is
+queried on demand through IPC; there is no heartbeat timer or heartbeat disk
+write. A slow UI reconciliation timer remains only as a safety net, while the
+resident tray performs no periodic polling.
+
+Configuration writes are atomic and preserve the previous valid JSON as a
+backup. Both file size and collection counts are bounded before the elevated
+agent accepts the configuration. The agent can read the backup without ever
+rewriting user-owned `%APPDATA%` data.
 
 ## Resource Usage
 
@@ -81,30 +89,36 @@ In normal use, the resident background footprint is only the Rust agent plus the
 tray helper. The Tauri/WebView UI is temporary; closing the window removes the
 interface from the steady-state workload.
 
-Preview measurement for `v0.1.0-preview` on a Windows desktop while idle with
-the UI closed:
+Preview measurement for `v0.2.0-preview.1` on a Windows desktop during a
+representative five-minute desktop session with the UI closed:
 
-| Mode | Running components | CPU while idle | Working set |
+| Mode | CPU sample | Working set | Private memory |
 | --- | --- | --- | --- |
-| Background mode | `powershift-agent.exe` + `powershift-tray.exe` | ~0.80 CPU seconds over 5 minutes | ~13.9 MB average, ~14.5 MB max |
-| Agent only | `powershift-agent.exe` | ~0.78 CPU seconds over 5 minutes | ~4.3 MB average, ~4.9 MB max |
-| Tray only | `powershift-tray.exe` | ~0.02 CPU seconds over 5 minutes | ~9.6 MB average, ~9.7 MB max |
-| UI open | Background components + `powershift.exe` WebView | Higher, temporary | Medium, temporary |
+| Background combined | ~0.078 s over 5 min | ~13.83 MB average | ~4.81 MB average |
+| Agent only | ~0.078 s over 5 min | ~4.92 MB average, 7.05 MB max | ~2.94 MB average |
+| Tray only | 0 measured over 5 min | ~8.91 MB average, 8.93 MB max | ~1.87 MB average |
+| UI tree only | 0 measured over 1 min | ~346.02 MB average | ~154.88 MB average |
 
 ```mermaid
 xychart-beta
-  title "Idle resident memory, UI closed (5 min preview sample)"
+  title "Resident memory, UI closed (5 min preview sample)"
   x-axis ["Agent", "Tray", "Combined"]
   y-axis "Working set (MB)" 0 --> 16
-  bar [4.3, 9.6, 13.9]
+  bar [4.92, 8.91, 13.83]
 ```
+
+The UI figure includes `powershift.exe` plus six Microsoft Edge WebView2
+processes. Working set counts shared Chromium pages and is therefore much larger
+than private memory. Closing PowerShift terminated the host and all six WebView2
+children immediately; only the two small Rust background processes remained.
+During the five-minute background sample, `agent-state.json` was not rewritten.
 
 The important behavior is not that the configuration UI uses no memory. It is
 that the UI is not the automation engine. Most of the time PowerShift should be
 closed to the tray, leaving the low-resource Rust background components active.
-These numbers describe the current preview build, not a final ceiling; continued
-optimization of the agent, tray, and process tracking model is part of the
-project roadmap.
+These numbers describe the current preview build on one machine, not a universal
+benchmark or final ceiling. Continued optimization of the agent, tray, and
+process tracking model remains part of the project roadmap.
 
 ## Detection Model
 
@@ -113,8 +127,8 @@ tight loop.
 
 Current flow:
 
-1. At startup, explicit reevaluation, configuration changes, or degraded WMI,
-   the agent performs one reconciliation snapshot.
+1. At startup, explicit reevaluation, configuration changes, a due restore, or
+   degraded WMI, the agent performs one reconciliation snapshot.
 2. A WMI start event is prefiltered by configured executable names, then only
    that PID is inspected for its path and creation time. If Windows has not
    made the handle available yet, PowerShift retries that exact PID after 150
@@ -128,19 +142,20 @@ Current flow:
 6. The highest-priority active profile controls the power plan. Once no
    profiles remain, PowerShift follows the configured restore behavior.
 
-The normal path uses no process polling, hooks, injection, memory reads,
-process modification, or direct interaction with games or anti-cheat systems.
+When no deadline or recovery work exists, the agent blocks indefinitely waiting
+for an event. The normal path uses no process polling, hooks, injection, memory
+reads, process modification, or direct interaction with games or anti-cheat systems.
 If WMI is degraded, the agent uses a bounded reconciliation fallback while the
 native exit waits keep tracking already-known processes.
 
 ## Installation
 
-Download the latest preview installer from GitHub Releases. Current tag: `v0.1.0-preview`.
+Download the latest preview installer from GitHub Releases. Current tag: `v0.2.0-preview.1`.
 
 Recommended release asset:
 
 ```text
-PowerShift_0.1.0-preview_x64-setup.exe
+PowerShift_0.2.0-preview.1_x64-setup.exe
 ```
 
 The installer contains the UI, agent, tray, and scheduled task setup.
@@ -186,7 +201,7 @@ npm.cmd run tauri -- build
 Generated installer:
 
 ```text
-target/release/bundle/nsis/PowerShift_0.1.0_x64-setup.exe
+target/release/bundle/nsis/PowerShift_0.2.0_x64-setup.exe
 ```
 
 ## Repository Policy
@@ -206,10 +221,10 @@ Publish installable builds through GitHub Releases instead.
 
 ## Roadmap
 
-- PID tracking for more precise close detection.
-- More diagnostics around active profile matching.
-- Stronger release packaging and signing.
-- More game compatibility testing.
+- Code signing for trusted publisher and SmartScreen reputation.
+- Broader game, launcher, protected-process, and multi-session compatibility
+  testing.
+- More diagnostics around active profile matching and degraded recovery.
 - UI polish and accessibility pass.
 
 ## License

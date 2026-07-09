@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
+import { getVersion } from '@tauri-apps/api/app';
 import {
   Activity,
   CheckCircle2,
@@ -76,10 +77,10 @@ type GameStatus = 'active' | 'inactive' | 'disabled';
 type GameProfile = UiGameProfile;
 type ProcessDrawerMode = 'processes' | 'candidates' | 'associate';
 
-const APP_VERSION = '0.1.0';
 const GITHUB_PROFILE_URL = 'https://github.com/4ismael1';
 
 const games = ref<GameProfile[]>([]);
+const appVersion = ref('');
 
 const query = ref('');
 const selectedId = ref('');
@@ -808,6 +809,11 @@ async function finishStartupRefresh() {
 }
 
 onMounted(() => {
+  void getVersion()
+    .then((version) => {
+      appVersion.value = version;
+    })
+    .catch(() => undefined);
   void subscribeToAgentState();
   void initializeApp();
   agentSnapshotTimer = window.setInterval(() => {
@@ -1294,7 +1300,7 @@ async function getTauriWindow() {
         </label>
 
         <div class="settings-about">
-          <span>PowerShift v{{ APP_VERSION }}</span>
+          <span>PowerShift{{ appVersion ? ` v${appVersion}` : '' }}</span>
           <button class="secondary-action compact" @click="openGithubProfile">
             <svg class="github-mark" viewBox="0 0 16 16" aria-hidden="true">
               <path

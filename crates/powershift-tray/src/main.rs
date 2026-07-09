@@ -95,9 +95,6 @@ fn ui_exe_candidates() -> Vec<std::path::PathBuf> {
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(windows)]
-const AGENT_TASK_NAME: &str = "PowerShiftAgent";
-
-#[cfg(windows)]
 fn configure_quiet_command(command: &mut std::process::Command) {
     use std::os::windows::process::CommandExt;
 
@@ -112,8 +109,10 @@ fn stop_agent_task() {
 
     let mut command = std::process::Command::new("schtasks");
     configure_quiet_command(&mut command);
+    let task_name = powershift_windows::agent_task_name()
+        .unwrap_or_else(|_| powershift_windows::LEGACY_AGENT_TASK_NAME.to_string());
     let _ = command
-        .args(["/End", "/TN", AGENT_TASK_NAME])
+        .args(["/End", "/TN", &task_name])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

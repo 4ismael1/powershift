@@ -261,11 +261,13 @@ describe('agentApi', () => {
 
     expect(isAgentStateStale(state, 100 + AGENT_STATE_STALE_MS)).toBe(false);
     expect(isAgentStateStale(state, 101 + AGENT_STATE_STALE_MS)).toBe(true);
-    expect(isAgentStateStale({ ...state, process_alive: true }, 101 + AGENT_STATE_STALE_MS)).toBe(false);
+    expect(isAgentStateStale({ ...state, process_alive: true }, 101 + AGENT_STATE_STALE_MS)).toBe(true);
+    expect(isAgentStateStale({ ...state, process_alive: true, ipc_connected: true }, 101 + AGENT_STATE_STALE_MS)).toBe(false);
+    expect(isAgentStateStale({ ...state, process_alive: false }, 100)).toBe(true);
     expect(describeAgentState(state, true, 101 + AGENT_STATE_STALE_MS)).toBe('Agente sin respuesta reciente');
-    expect(describeAgentState({ ...state, process_alive: true }, true, 101 + AGENT_STATE_STALE_MS)).toBe('Agente elevado activo');
+    expect(describeAgentState({ ...state, process_alive: true, ipc_connected: true }, true, 101 + AGENT_STATE_STALE_MS)).toBe('Agente elevado activo');
     expect(agentStateTone(state, true, 101 + AGENT_STATE_STALE_MS)).toBe('warning');
-    expect(agentStateTone({ ...state, process_alive: true }, true, 101 + AGENT_STATE_STALE_MS)).toBe('ready');
+    expect(agentStateTone({ ...state, process_alive: true, ipc_connected: true }, true, 101 + AGENT_STATE_STALE_MS)).toBe('ready');
     expect(agentStateTone({ ...state, status: 'error', updated_at_ms: 200, last_error: 'fallo' }, true, 200)).toBe('error');
     expect(agentStateTone({ ...state, status: 'running', updated_at_ms: 200 }, true, 200)).toBe('ready');
   });

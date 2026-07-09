@@ -1,5 +1,16 @@
 use crate::{PowerError, PowerResult};
 
+pub const LEGACY_AGENT_TASK_NAME: &str = "PowerShiftAgent";
+const AGENT_TASK_NAME_PREFIX: &str = "PowerShiftAgent-";
+
+pub fn agent_task_name() -> PowerResult<String> {
+    current_user_sid_string().map(|sid| agent_task_name_for_sid(&sid))
+}
+
+pub fn agent_task_name_for_sid(sid: &str) -> String {
+    format!("{AGENT_TASK_NAME_PREFIX}{sid}")
+}
+
 #[cfg(windows)]
 pub fn current_user_sid_string() -> PowerResult<String> {
     use windows::core::PWSTR;
@@ -69,5 +80,17 @@ mod tests {
         assert!(sid
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'));
+    }
+
+    #[test]
+    fn agent_task_name_is_stable_and_scoped_to_one_sid() {
+        assert_eq!(
+            agent_task_name_for_sid("S-1-5-21-1000"),
+            "PowerShiftAgent-S-1-5-21-1000"
+        );
+        assert_ne!(
+            agent_task_name_for_sid("S-1-5-21-1000"),
+            agent_task_name_for_sid("S-1-5-21-2000")
+        );
     }
 }

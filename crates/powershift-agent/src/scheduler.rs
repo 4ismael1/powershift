@@ -1,4 +1,4 @@
-use crate::{next_wait_at, now_ms, AgentRuntimeState};
+use crate::{next_restore_wait_at, now_ms, AgentRuntimeState};
 use powershift_core::AppConfig;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -238,17 +238,27 @@ pub(crate) fn next_wait_with_scheduler(
     state: &AgentRuntimeState,
     scheduler: &AgentScanScheduler,
     watcher_health_degraded: bool,
-) -> Duration {
+) -> Option<Duration> {
     let now = now_ms();
+    let restore_wait = next_restore_wait_at(state, now);
     let base = if watcher_health_degraded {
-        next_wait_at(state, now).min(DEGRADED_PROCESS_SCAN_INTERVAL)
+        Some(
+            restore_wait
+                .unwrap_or(DEGRADED_PROCESS_SCAN_INTERVAL)
+                .min(DEGRADED_PROCESS_SCAN_INTERVAL),
+        )
     } else {
-        next_wait_at(state, now)
+        restore_wait
     };
-    scheduler
-        .next_wait(now)
-        .map(|scheduler_wait| scheduler_wait.min(base))
-        .unwrap_or(base)
+    minimum_wait(base, scheduler.next_wait(now))
+}
+
+pub(crate) fn minimum_wait(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(wait), None) | (None, Some(wait)) => Some(wait),
+        (None, None) => None,
+    }
 }
 
 pub(crate) fn is_agent_wake_event(event: &powershift_windows::ProcessEvent) -> bool {
@@ -378,5 +388,18 @@ mod tests {
         queue.remove(42);
 
         assert!(queue.take_due(10_000).is_empty());
+    }
+
+    #[test]
+    fn optional_waits_block_indefinitely_when_no_deadline_exists() {
+        assert_eq!(minimum_wait(None, None), None);
+        assert_eq!(
+            minimum_wait(Some(Duration::from_secs(5)), None),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            minimum_wait(Some(Duration::from_secs(5)), Some(Duration::from_secs(2))),
+            Some(Duration::from_secs(2))
+        );
     }
 }

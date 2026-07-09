@@ -37,23 +37,20 @@ use process_runtime::apply_observed_stop;
 use process_runtime::{apply_observed_start, apply_process_event, tracked_process_from_snapshot};
 #[cfg(test)]
 use publisher::{
-    agent_error_message, publish_error, publish_heartbeat, publish_scan_outcome, scan_event_entry,
-    MAX_EVENT_LOG_BYTES,
+    agent_error_message, publish_error, publish_scan_outcome, scan_event_entry, MAX_EVENT_LOG_BYTES,
 };
 use publisher::{
-    publish_error_with_shared, publish_heartbeat_with_shared, publish_scan_outcome_with_shared,
-    write_scan_event, AgentPublishMemory,
+    publish_error_with_shared, publish_scan_outcome_with_shared, write_scan_event,
+    AgentPublishMemory,
 };
 #[cfg(test)]
 use scheduler::DEGRADED_PROCESS_SCAN_INTERVAL;
 use scheduler::{
-    agent_wake_event, is_agent_wake_event, next_wait_with_scheduler, AgentScanScheduler,
-    AgentWatchSet, TargetedInspectionQueue,
+    agent_wake_event, is_agent_wake_event, minimum_wait, next_wait_with_scheduler,
+    AgentScanScheduler, AgentWatchSet, TargetedInspectionQueue,
 };
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
-
-const AGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 fn synchronize_watcher_health(
     watcher_health: &WmiWatcherStatus,
@@ -190,15 +187,12 @@ pub fn run_agent_forever() -> Result<(), String> {
         &mut publish_memory,
         Some(&shared_state),
     )?;
-
     loop {
         let receive_timeout =
             next_wait_with_scheduler(&runtime, &scheduler, watcher_health.is_degraded());
-        let receive_timeout = pending_inspections
-            .next_wait(now_ms())
-            .map(|pending_wait| pending_wait.min(receive_timeout))
-            .unwrap_or(receive_timeout);
-        match receiver.recv_timeout(receive_timeout) {
+        let receive_timeout =
+            minimum_wait(receive_timeout, pending_inspections.next_wait(now_ms()));
+        match receive_process_message(&receiver, receive_timeout) {
             Ok(ProcessWatchMessage::Event(event)) => {
                 if is_agent_wake_event(&event) {
                     scheduler.record_public_wake(now_ms());
@@ -393,8 +387,6 @@ pub fn run_agent_forever() -> Result<(), String> {
                         &mut publish_memory,
                         Some(&shared_state),
                     )?;
-                } else {
-                    publish_heartbeat_with_shared(&paths, &publish_memory, Some(&shared_state))?;
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
@@ -532,14 +524,21 @@ where
     result
 }
 
-fn next_wait_at(state: &AgentRuntimeState, now_ms: u64) -> Duration {
-    let restore_delay = state
+fn receive_process_message(
+    receiver: &mpsc::Receiver<ProcessWatchMessage>,
+    timeout: Option<Duration>,
+) -> Result<ProcessWatchMessage, RecvTimeoutError> {
+    match timeout {
+        Some(timeout) => receiver.recv_timeout(timeout),
+        None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
+    }
+}
+
+fn next_restore_wait_at(state: &AgentRuntimeState, now_ms: u64) -> Option<Duration> {
+    state
         .pending_restore
         .as_ref()
-        .map(|restore| Duration::from_millis(restore.due_at_ms.saturating_sub(now_ms)));
-    restore_delay
-        .map(|delay| delay.min(AGENT_HEARTBEAT_INTERVAL))
-        .unwrap_or(AGENT_HEARTBEAT_INTERVAL)
+        .map(|restore| Duration::from_millis(restore.due_at_ms.saturating_sub(now_ms)))
 }
 
 fn restore_due(state: &AgentRuntimeState) -> bool {
@@ -1534,34 +1533,6 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_updates_live_ipc_state_without_touching_disk() {
-        let paths = temp_agent_paths("heartbeat");
-        let memory = AgentPublishMemory {
-            last_scan: Some(active_scan()),
-            last_error: None,
-            process_tracking: ProcessTrackingStatus {
-                tracked_instances: 3,
-                registered_exit_waits: 3,
-                unavailable_exit_waits: 0,
-                pending_targeted_inspections: 0,
-            },
-            wmi_watchers: WmiWatcherStatus::default(),
-        };
-        let shared = AgentSharedState::default();
-
-        publish_heartbeat_with_shared(&paths, &memory, Some(&shared)).expect("publish heartbeat");
-
-        let state = shared.get().expect("shared heartbeat state");
-        assert_eq!(state.status, AgentStatus::Running);
-        assert_eq!(state.last_scan, Some(active_scan()));
-        assert_eq!(state.last_error, None);
-        assert_eq!(state.process_tracking, memory.process_tracking);
-        assert!(!paths.state.exists());
-
-        let _ = std::fs::remove_dir_all(paths.state.parent().expect("state parent"));
-    }
-
-    #[test]
     fn publish_state_does_not_leave_temp_file_after_success() {
         let paths = temp_agent_paths("atomic-state");
         let state = PublishedAgentState {
@@ -1636,8 +1607,6 @@ mod tests {
             &mut memory,
         )
         .expect("error publish is best effort");
-        publish_heartbeat(&blocked_paths, &memory).expect("heartbeat publish is best effort");
-
         let _ = std::fs::remove_dir_all(paths.state.parent().expect("state parent"));
     }
 
@@ -1668,15 +1637,15 @@ mod tests {
     }
 
     #[test]
-    fn next_wait_uses_heartbeat_without_pending_restore() {
+    fn agent_has_no_timer_when_no_restore_or_recovery_work_is_pending() {
         assert_eq!(
-            next_wait_at(&AgentRuntimeState::default(), 1_000),
-            AGENT_HEARTBEAT_INTERVAL
+            next_restore_wait_at(&AgentRuntimeState::default(), 1_000),
+            None
         );
     }
 
     #[test]
-    fn next_wait_prefers_due_restore_over_heartbeat() {
+    fn next_wait_targets_the_pending_restore_deadline() {
         let state = AgentRuntimeState {
             pending_restore: Some(PendingRestoreState {
                 due_at_ms: 1_500,
@@ -1687,12 +1656,15 @@ mod tests {
             ..AgentRuntimeState::default()
         };
 
-        assert_eq!(next_wait_at(&state, 1_000), Duration::from_millis(500));
+        assert_eq!(
+            next_restore_wait_at(&state, 1_000),
+            Some(Duration::from_millis(500))
+        );
         assert!(restore_due_at(&state, 1_500));
     }
 
     #[test]
-    fn next_wait_caps_long_restore_delay_to_heartbeat() {
+    fn long_restore_delay_is_not_shortened_by_periodic_background_work() {
         let state = AgentRuntimeState {
             pending_restore: Some(PendingRestoreState {
                 due_at_ms: 120_000,
@@ -1703,7 +1675,10 @@ mod tests {
             ..AgentRuntimeState::default()
         };
 
-        assert_eq!(next_wait_at(&state, 1_000), AGENT_HEARTBEAT_INTERVAL);
+        assert_eq!(
+            next_restore_wait_at(&state, 1_000),
+            Some(Duration::from_secs(119))
+        );
         assert!(!restore_due_at(&state, 1_000));
     }
 
@@ -1723,7 +1698,7 @@ mod tests {
                 &AgentScanScheduler::default(),
                 health.is_degraded()
             ),
-            DEGRADED_PROCESS_SCAN_INTERVAL
+            Some(DEGRADED_PROCESS_SCAN_INTERVAL)
         );
     }
 

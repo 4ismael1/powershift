@@ -1,6 +1,6 @@
 [package]
 name = "powershift"
-version = "0.1.0"
+version = "0.2.0"
 description = "Automatic Windows power plan switcher for games"
 authors = []
 edition = "2021"
@@ -16,7 +16,7 @@ tauri-build = { version = "2", features = [] }
 powershift-core = { path = "../crates/powershift-core" }
 powershift-windows = { path = "../crates/powershift-windows", features = ["icons"] }
 powershift-agent = { path = "../crates/powershift-agent" }
-tauri = { version = "2" }
+tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri-plugin-dialog = "2"

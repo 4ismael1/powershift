@@ -51,14 +51,26 @@ FunctionEnd
   Delete "$APPDATA\PowerShift\events.jsonl"
   Delete "$APPDATA\PowerShift\events.jsonl.1"
 
-  nsExec::ExecToLog `powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$agentPath = '$INSTDIR\powershift-agent.exe'; $$action = New-ScheduledTaskAction -Execute $$agentPath; $$trigger = New-ScheduledTaskTrigger -AtLogOn; $$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); $$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $$principal = New-ScheduledTaskPrincipal -UserId $$user -LogonType Interactive -RunLevel Highest; Register-ScheduledTask -TaskName 'PowerShiftAgent' -Action $$action -Trigger $$trigger -Settings $$settings -Principal $$principal -Force | Out-Null"`
+  nsExec::ExecToLog `powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$ErrorActionPreference = 'Stop'; $$agentPath = '$INSTDIR\powershift-agent.exe'; $$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent(); $$sid = $$identity.User.Value; $$taskName = 'PowerShiftAgent-' + $$sid; $$action = New-ScheduledTaskAction -Execute $$agentPath; $$trigger = New-ScheduledTaskTrigger -AtLogOn; $$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); $$principal = New-ScheduledTaskPrincipal -UserId $$identity.Name -LogonType Interactive -RunLevel Highest; Register-ScheduledTask -TaskName $$taskName -Action $$action -Trigger $$trigger -Settings $$settings -Principal $$principal -Force | Out-Null"`
+  Pop $0
+  ${If} $0 != 0
+    MessageBox MB_ICONSTOP|MB_OK "PowerShift no pudo registrar el agente elevado. La instalación no puede continuar."
+    Abort
+  ${EndIf}
+
+  ; Migrate the global preview task after the SID-scoped replacement exists.
+  nsExec::ExecToLog 'powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Stop-ScheduledTask -TaskName PowerShiftAgent -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName PowerShiftAgent -Confirm:$$false -ErrorAction SilentlyContinue"'
   Pop $0
 
   ${If} $PowerShiftStartupEnabled = 1
-    nsExec::ExecToLog 'schtasks /Run /TN "PowerShiftAgent"'
+    nsExec::ExecToLog `powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$ErrorActionPreference = 'Stop'; $$taskName = 'PowerShiftAgent-' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; Start-ScheduledTask -TaskName $$taskName"`
     Pop $0
+    ${If} $0 != 0
+      MessageBox MB_ICONSTOP|MB_OK "PowerShift instaló el agente, pero Windows no pudo iniciarlo."
+      Abort
+    ${EndIf}
   ${Else}
-    nsExec::ExecToLog 'powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$task = Get-ScheduledTask -TaskName PowerShiftAgent -ErrorAction SilentlyContinue; if ($$task) { foreach ($$trigger in $$task.Triggers) { $$trigger.Enabled = $$false }; Set-ScheduledTask -TaskName PowerShiftAgent -Trigger $$task.Triggers | Out-Null }"'
+    nsExec::ExecToLog `powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$taskName = 'PowerShiftAgent-' + [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $$task = Get-ScheduledTask -TaskName $$taskName -ErrorAction SilentlyContinue; if ($$task) { foreach ($$trigger in $$task.Triggers) { $$trigger.Enabled = $$false }; Set-ScheduledTask -TaskName $$taskName -Trigger $$task.Triggers | Out-Null }"`
     Pop $0
   ${EndIf}
 
@@ -77,10 +89,7 @@ FunctionEnd
     Sleep 1200
   ${EndIf}
 
-  nsExec::ExecToLog 'schtasks /End /TN "PowerShiftAgent"'
-  Pop $0
-
-  nsExec::ExecToLog 'schtasks /Delete /F /TN "PowerShiftAgent"'
+  nsExec::ExecToLog `powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$tasks = @(Get-ScheduledTask -TaskName 'PowerShiftAgent-*' -ErrorAction SilentlyContinue); $$legacy = Get-ScheduledTask -TaskName 'PowerShiftAgent' -ErrorAction SilentlyContinue; if ($$legacy) { $$tasks += $$legacy }; foreach ($$task in $$tasks) { Stop-ScheduledTask -TaskName $$task.TaskName -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $$task.TaskName -Confirm:$$false -ErrorAction SilentlyContinue }"`
   Pop $0
 
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "PowerShiftTray"
@@ -88,7 +97,6 @@ FunctionEnd
   RMDir /r "$APPDATA\PowerShift"
   RMDir /r "$LOCALAPPDATA\com.powershift.desktop"
   RMDir /r "$LOCALAPPDATA\PowerShift"
-  nsExec::ExecToLog 'powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value; $$users = Join-Path \"$PROGRAMDATA\PowerShift\" \"users\"; $$runtime = Join-Path $$users $$sid; Remove-Item -LiteralPath $$runtime -Recurse -Force -ErrorAction SilentlyContinue; if ((Test-Path -LiteralPath $$users) -and -not (Get-ChildItem -LiteralPath $$users -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $$users -Force -ErrorAction SilentlyContinue }; $$product = \"$PROGRAMDATA\PowerShift\"; if ((Test-Path -LiteralPath $$product) -and -not (Get-ChildItem -LiteralPath $$product -Force -ErrorAction SilentlyContinue)) { Remove-Item -LiteralPath $$product -Force -ErrorAction SilentlyContinue }"'
-  Pop $0
+  RMDir /r "$PROGRAMDATA\PowerShift"
   Delete "$TEMP\powershift-exe-icon.png"
 !macroend
