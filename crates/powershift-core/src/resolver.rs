@@ -64,6 +64,31 @@ pub fn choose_power_plan(
         })
 }
 
+/// Returns whether a process can contribute to any enabled profile. This is
+/// intentionally less strict than activation: associated processes must be
+/// retained too, so they can participate once the main executable appears.
+pub fn process_matches_enabled_profile(config: &AppConfig, process: &DetectedProcess) -> bool {
+    if !config.agent.enabled || !config.automation.enabled {
+        return false;
+    }
+
+    config
+        .profiles
+        .iter()
+        .filter(|profile| profile.enabled)
+        .any(|profile| {
+            process_matches_executable(
+                process,
+                &profile.main_executable.name,
+                profile.main_executable.path.as_deref(),
+                profile.activation.match_mode,
+            ) || profile
+                .associated_processes
+                .iter()
+                .any(|matcher| process_matches_matcher(process, matcher))
+        })
+}
+
 fn active_profile_for(profile: &Profile, processes: &[DetectedProcess]) -> Option<ActiveProfile> {
     if !profile.enabled {
         return None;
@@ -322,6 +347,40 @@ mod tests {
         let active = resolve_active_profiles(&config, &processes);
 
         assert_eq!(active.len(), 1);
+    }
+
+    #[test]
+    fn identifies_processes_that_can_contribute_before_a_profile_is_active() {
+        let mut profile = Profile::new("apex", "Apex Legends", "r5apex.exe", "high");
+        profile
+            .associated_processes
+            .push(ProcessMatcher::by_name("EasyAntiCheat.exe"));
+        let config = config_with_profiles(vec![profile]);
+
+        assert!(process_matches_enabled_profile(
+            &config,
+            &process(11, "EasyAntiCheat.exe", None),
+        ));
+        assert!(!process_matches_enabled_profile(
+            &config,
+            &process(12, "notepad.exe", None),
+        ));
+    }
+
+    #[test]
+    fn does_not_watch_processes_when_automation_is_disabled() {
+        let mut config = config_with_profiles(vec![Profile::new(
+            "apex",
+            "Apex Legends",
+            "r5apex.exe",
+            "high",
+        )]);
+        config.automation.enabled = false;
+
+        assert!(!process_matches_enabled_profile(
+            &config,
+            &process(10, "r5apex.exe", None),
+        ));
     }
 
     #[test]

@@ -44,7 +44,7 @@ FunctionEnd
   ; The tray remains a normal user process so opening the UI never requires elevation.
   Call PowerShiftReadExistingConfigFlags
 
-  nsExec::ExecToLog `powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$agentPath = '$INSTDIR\powershift-agent.exe'; $$action = New-ScheduledTaskAction -Execute $$agentPath; $$trigger = New-ScheduledTaskTrigger -AtLogOn; $$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Days 3); $$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $$principal = New-ScheduledTaskPrincipal -UserId $$user -LogonType Interactive -RunLevel Highest; Register-ScheduledTask -TaskName 'PowerShiftAgent' -Action $$action -Trigger $$trigger -Settings $$settings -Principal $$principal -Force | Out-Null"`
+  nsExec::ExecToLog `powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$agentPath = '$INSTDIR\powershift-agent.exe'; $$action = New-ScheduledTaskAction -Execute $$agentPath; $$trigger = New-ScheduledTaskTrigger -AtLogOn; $$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1); $$user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; $$principal = New-ScheduledTaskPrincipal -UserId $$user -LogonType Interactive -RunLevel Highest; Register-ScheduledTask -TaskName 'PowerShiftAgent' -Action $$action -Trigger $$trigger -Settings $$settings -Principal $$principal -Force | Out-Null"`
   Pop $0
 
   ${If} $PowerShiftStartupEnabled = 1

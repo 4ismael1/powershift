@@ -7,7 +7,8 @@ use tauri::Manager;
 
 const TASK_NAME: &str = "PowerShiftAgent";
 const AGENT_EXE_NAME: &str = "powershift-agent.exe";
-const TASK_EXECUTION_LIMIT_DAYS: u8 = 3;
+const TASK_RESTART_COUNT: u8 = 3;
+const TASK_RESTART_INTERVAL_MINUTES: u8 = 1;
 const AGENT_START_TIMEOUT: Duration = Duration::from_secs(6);
 const AGENT_START_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -349,7 +350,7 @@ fn scheduled_task_registration_powershell(agent_path: &Path) -> String {
         "$agentPath = '{escaped_path}'; \
          $action = New-ScheduledTaskAction -Execute $agentPath; \
          $trigger = New-ScheduledTaskTrigger -AtLogOn; \
-         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Days {TASK_EXECUTION_LIMIT_DAYS}); \
+         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount {TASK_RESTART_COUNT} -RestartInterval (New-TimeSpan -Minutes {TASK_RESTART_INTERVAL_MINUTES}); \
          $user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name; \
          $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Highest; \
          Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null"
@@ -359,7 +360,7 @@ fn scheduled_task_registration_powershell(agent_path: &Path) -> String {
 #[cfg(test)]
 fn task_settings_probe_powershell() -> &'static str {
     "$task = Get-ScheduledTask -TaskName 'PowerShiftAgent' -ErrorAction Stop; \
-     if ($task.Settings.DisallowStartIfOnBatteries -or $task.Settings.StopIfGoingOnBatteries -or -not $task.Settings.StartWhenAvailable) { exit 2 }; \
+     if ($task.Settings.DisallowStartIfOnBatteries -or $task.Settings.StopIfGoingOnBatteries -or -not $task.Settings.StartWhenAvailable -or $task.Settings.ExecutionTimeLimit -ne 'PT0S' -or $task.Settings.RestartCount -lt 3) { exit 2 }; \
      exit 0"
 }
 
@@ -428,6 +429,10 @@ mod tests {
         assert!(script.contains("New-ScheduledTaskPrincipal"));
         assert!(script.contains("-RunLevel Highest"));
         assert!(script.contains("C:\\PowerShift\\powershift-agent.exe"));
+        assert!(script.contains("-ExecutionTimeLimit ([TimeSpan]::Zero)"));
+        assert!(script.contains("-RestartCount 3"));
+        assert!(script.contains("-RestartInterval (New-TimeSpan -Minutes 1)"));
+        assert!(!script.contains("New-TimeSpan -Days"));
     }
 
     #[test]
@@ -481,6 +486,9 @@ mod tests {
         assert!(probe.contains("DisallowStartIfOnBatteries"));
         assert!(probe.contains("StopIfGoingOnBatteries"));
         assert!(probe.contains("StartWhenAvailable"));
+        assert!(probe.contains("ExecutionTimeLimit"));
+        assert!(probe.contains("RestartCount"));
+        assert!(probe.contains("PT0S"));
         assert!(probe.contains("exit 2"));
     }
 
@@ -503,6 +511,7 @@ mod tests {
             updated_at_ms: 1,
             last_scan: None,
             last_error: None,
+            process_tracking: Default::default(),
         });
 
         assert!(response.process_alive);
@@ -517,6 +526,7 @@ mod tests {
             updated_at_ms: 1,
             last_scan: None,
             last_error: None,
+            process_tracking: Default::default(),
         });
 
         assert!(response.process_alive);
@@ -534,6 +544,7 @@ mod tests {
                 "WMI requiere permisos elevados para eventos de proceso. Instala o inicia el agente elevado."
                     .to_string(),
             ),
+            process_tracking: Default::default(),
         };
 
         assert!(agent_state_requires_elevated_restart(&state));
@@ -553,6 +564,7 @@ mod tests {
             updated_at_ms: 1,
             last_scan: None,
             last_error: Some("No se pudo leer config.json".to_string()),
+            process_tracking: Default::default(),
         };
 
         assert!(!agent_state_requires_elevated_restart(&state));

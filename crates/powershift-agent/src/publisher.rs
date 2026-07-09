@@ -1,5 +1,5 @@
 use crate::ipc::AgentSharedState;
-use crate::{now_ms, AgentPaths, AgentScanResult, PublishedAgentState};
+use crate::{now_ms, AgentPaths, AgentScanResult, ProcessTrackingStatus, PublishedAgentState};
 use powershift_core::AgentStatus;
 use powershift_windows::PowerManagerBackend;
 use serde::{Deserialize, Serialize};
@@ -11,6 +11,7 @@ pub(crate) const MAX_EVENT_LOG_BYTES: u64 = 1_000_000;
 pub(crate) struct AgentPublishMemory {
     pub(crate) last_scan: Option<AgentScanResult>,
     pub(crate) last_error: Option<String>,
+    pub(crate) process_tracking: ProcessTrackingStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +78,7 @@ pub(crate) fn publish_scan_outcome_with_shared(
                         updated_at_ms: now_ms(),
                         last_scan: Some(scan),
                         last_error: None,
+                        process_tracking: memory.process_tracking.clone(),
                     },
                     shared_state,
                 );
@@ -99,6 +101,7 @@ pub(crate) fn publish_scan_outcome_with_shared(
                         updated_at_ms: now_ms(),
                         last_scan: memory.last_scan.clone(),
                         last_error: Some(message),
+                        process_tracking: memory.process_tracking.clone(),
                     },
                     shared_state,
                 );
@@ -138,6 +141,7 @@ pub(crate) fn publish_error_with_shared(
                 updated_at_ms: now_ms(),
                 last_scan: memory.last_scan.clone(),
                 last_error: Some(message),
+                process_tracking: memory.process_tracking.clone(),
             },
             shared_state,
         );
@@ -169,6 +173,7 @@ pub(crate) fn publish_heartbeat_with_shared(
             updated_at_ms: now_ms(),
             last_scan: memory.last_scan.clone(),
             last_error: memory.last_error.clone(),
+            process_tracking: memory.process_tracking.clone(),
         });
     }
     Ok(())

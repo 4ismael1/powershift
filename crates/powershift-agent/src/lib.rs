@@ -1,9 +1,10 @@
 use powershift_core::{
-    resolve_active_profiles, ActiveProfile, AgentStatus, AppConfig, ConfigStore, DetectedProcess,
-    RestoreBehavior,
+    process_matches_enabled_profile, resolve_active_profiles, ActiveProfile, AgentStatus,
+    AppConfig, ConfigStore, DetectedProcess, ProcessInfo, RestoreBehavior,
 };
 mod ipc;
 mod paths;
+mod process_registry;
 mod publisher;
 mod scheduler;
 
@@ -18,9 +19,11 @@ pub use publisher::{append_event_to_path, publish_state, EventLogEntry};
 use ipc::handle_agent_ipc_request;
 use ipc::{load_or_create_control_token, spawn_agent_ipc_server, AgentSharedState};
 use powershift_windows::{
-    create_agent_wake_event, spawn_process_event_watchers, wait_for_agent_wake, PowerManager,
-    PowerManagerBackend, ProcessSnapshotBackend, ProcessWatchMessage, SystemProcessBackend,
+    create_agent_wake_event, inspect_process, spawn_process_event_watchers, wait_for_agent_wake,
+    ObservedProcess, PowerManager, PowerManagerBackend, ProcessInstanceId, ProcessSnapshotBackend,
+    ProcessWatchMessage, SystemProcessBackend,
 };
+use process_registry::{ProcessExitWatchSet, ProcessRegistry, TrackedProcess};
 #[cfg(test)]
 use publisher::{
     agent_error_message, publish_error, publish_heartbeat, publish_scan_outcome, scan_event_entry,
@@ -30,13 +33,11 @@ use publisher::{
     publish_error_with_shared, publish_heartbeat_with_shared, publish_scan_outcome_with_shared,
     write_scan_event, AgentPublishMemory,
 };
-use scheduler::{
-    active_profile_id_set, agent_wake_event, is_agent_wake_event, next_wait_with_scheduler,
-    AgentScanScheduler, AgentWatchSet,
-};
 #[cfg(test)]
+use scheduler::DEGRADED_PROCESS_SCAN_INTERVAL;
 use scheduler::{
-    duration_ms, DEGRADED_PROCESS_SCAN_INTERVAL, PROCESS_EVENT_DEBOUNCE, PUBLIC_WAKE_EVENT_COOLDOWN,
+    agent_wake_event, is_agent_wake_event, next_wait_with_scheduler, AgentScanScheduler,
+    AgentWatchSet, TargetedInspectionQueue,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -92,6 +93,16 @@ pub struct PublishedAgentState {
     pub updated_at_ms: u64,
     pub last_scan: Option<AgentScanResult>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub process_tracking: ProcessTrackingStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProcessTrackingStatus {
+    pub tracked_instances: u32,
+    pub registered_exit_waits: u32,
+    pub unavailable_exit_waits: u32,
+    pub pending_targeted_inspections: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -113,12 +124,45 @@ impl AgentWatcherHealth {
     }
 }
 
+fn synchronize_exit_watches(
+    exit_watches: &mut ProcessExitWatchSet,
+    registry: &ProcessRegistry,
+    pending_inspections: &TargetedInspectionQueue,
+    sender: &mpsc::Sender<ProcessWatchMessage>,
+    shared_state: &AgentSharedState,
+    publish_memory: &mut AgentPublishMemory,
+) {
+    exit_watches.synchronize(registry, sender);
+    let tracking = ProcessTrackingStatus {
+        tracked_instances: registry.instances().count().try_into().unwrap_or(u32::MAX),
+        registered_exit_waits: exit_watches
+            .registered_count()
+            .try_into()
+            .unwrap_or(u32::MAX),
+        unavailable_exit_waits: exit_watches
+            .unavailable_count()
+            .try_into()
+            .unwrap_or(u32::MAX),
+        pending_targeted_inspections: pending_inspections.len().try_into().unwrap_or(u32::MAX),
+    };
+    publish_memory.process_tracking = tracking.clone();
+    if let Some(mut state) = shared_state.get() {
+        if state.process_tracking != tracking {
+            state.process_tracking = tracking;
+            shared_state.set(state);
+        }
+    }
+}
+
 pub fn run_agent_forever() -> Result<(), String> {
     let paths = AgentPaths::from_app_data();
     let mut runtime = AgentRuntimeState::default();
     let mut publish_memory = AgentPublishMemory::default();
     let mut scheduler = AgentScanScheduler::default();
     let mut watcher_health = AgentWatcherHealth::default();
+    let mut process_registry = ProcessRegistry::default();
+    let mut exit_watches = ProcessExitWatchSet::default();
+    let mut pending_inspections = TargetedInspectionQueue::default();
     let shared_state = AgentSharedState::default();
     let process_backend = SystemProcessBackend;
     let power_backend = PowerManager::new();
@@ -130,6 +174,7 @@ pub fn run_agent_forever() -> Result<(), String> {
         updated_at_ms: now_ms(),
         last_scan: None,
         last_error: None,
+        process_tracking: ProcessTrackingStatus::default(),
     };
     shared_state.set(starting_state.clone());
     publish_state(&paths.state, starting_state)?;
@@ -165,8 +210,25 @@ pub fn run_agent_forever() -> Result<(), String> {
         }
     });
 
-    let (scan_result, mut watch_set) =
-        run_agent_scan_cycle_with_paths(&paths, &process_backend, &power_backend, &mut runtime);
+    let mut config = AppConfig::default();
+    let mut watch_set = AgentWatchSet::default();
+    let scan_result = refresh_config_and_reconcile(
+        &paths,
+        &process_backend,
+        &power_backend,
+        &mut runtime,
+        &mut config,
+        &mut watch_set,
+        &mut process_registry,
+    );
+    synchronize_exit_watches(
+        &mut exit_watches,
+        &process_registry,
+        &pending_inspections,
+        &sender,
+        &shared_state,
+        &mut publish_memory,
+    );
     publish_scan_outcome_with_shared(
         &paths,
         scan_result,
@@ -175,29 +237,53 @@ pub fn run_agent_forever() -> Result<(), String> {
     )?;
 
     loop {
-        match receiver.recv_timeout(next_wait_with_scheduler(
-            &runtime,
-            &scheduler,
-            watcher_health.is_degraded(),
-        )) {
+        let receive_timeout =
+            next_wait_with_scheduler(&runtime, &scheduler, watcher_health.is_degraded());
+        let receive_timeout = pending_inspections
+            .next_wait(now_ms())
+            .map(|pending_wait| pending_wait.min(receive_timeout))
+            .unwrap_or(receive_timeout);
+        match receiver.recv_timeout(receive_timeout) {
             Ok(ProcessWatchMessage::Event(event)) => {
                 if is_agent_wake_event(&event) {
                     scheduler.record_public_wake(now_ms());
                 } else {
-                    scheduler.record_process_event(
-                        &event,
-                        &watch_set,
-                        &active_profile_id_set(&runtime),
-                        now_ms(),
+                    let was_stop = event.kind == powershift_windows::ProcessEventKind::Stopped;
+                    if event.kind == powershift_windows::ProcessEventKind::Stopped {
+                        pending_inspections.remove(event.pid);
+                    }
+                    let application =
+                        apply_process_event(&event, &config, &watch_set, &mut process_registry);
+                    if let Some((pid, name)) = application.deferred_inspection {
+                        pending_inspections.schedule_initial(pid, name, now_ms());
+                    }
+                    if !application.changed {
+                        if was_stop || pending_inspections.len() > 0 {
+                            synchronize_exit_watches(
+                                &mut exit_watches,
+                                &process_registry,
+                                &pending_inspections,
+                                &sender,
+                                &shared_state,
+                                &mut publish_memory,
+                            );
+                        }
+                        continue;
+                    }
+                    synchronize_exit_watches(
+                        &mut exit_watches,
+                        &process_registry,
+                        &pending_inspections,
+                        &sender,
+                        &shared_state,
+                        &mut publish_memory,
                     );
-                }
-
-                if scheduler.due(now_ms()) {
-                    let (scan_result, next_watch_set) = run_agent_scan_cycle_with_paths(
+                    let scan_result = evaluate_registry_with_paths(
                         &paths,
-                        &process_backend,
                         &power_backend,
                         &mut runtime,
+                        &config,
+                        &process_registry,
                     );
                     publish_scan_outcome_with_shared(
                         &paths,
@@ -205,26 +291,35 @@ pub fn run_agent_forever() -> Result<(), String> {
                         &mut publish_memory,
                         Some(&shared_state),
                     )?;
-                    scheduler.mark_scan_completed(now_ms());
-                    watch_set = next_watch_set;
+                }
+            }
+            Ok(ProcessWatchMessage::TrackedProcessExited(instance)) => {
+                if process_registry.remove_exact(&instance) {
+                    synchronize_exit_watches(
+                        &mut exit_watches,
+                        &process_registry,
+                        &pending_inspections,
+                        &sender,
+                        &shared_state,
+                        &mut publish_memory,
+                    );
+                    let scan_result = evaluate_registry_with_paths(
+                        &paths,
+                        &power_backend,
+                        &mut runtime,
+                        &config,
+                        &process_registry,
+                    );
+                    publish_scan_outcome_with_shared(
+                        &paths,
+                        scan_result,
+                        &mut publish_memory,
+                        Some(&shared_state),
+                    )?;
                 }
             }
             Ok(ProcessWatchMessage::Reevaluate) => {
                 scheduler.schedule_forced(now_ms());
-                let (scan_result, next_watch_set) = run_agent_scan_cycle_with_paths(
-                    &paths,
-                    &process_backend,
-                    &power_backend,
-                    &mut runtime,
-                );
-                publish_scan_outcome_with_shared(
-                    &paths,
-                    scan_result,
-                    &mut publish_memory,
-                    Some(&shared_state),
-                )?;
-                scheduler.mark_scan_completed(now_ms());
-                watch_set = next_watch_set;
             }
             Ok(ProcessWatchMessage::Error(error)) => {
                 publish_error_with_shared(&paths, &error, &mut publish_memory, Some(&shared_state))?
@@ -245,12 +340,65 @@ pub fn run_agent_forever() -> Result<(), String> {
             }
             Ok(ProcessWatchMessage::Shutdown) => return Ok(()),
             Err(RecvTimeoutError::Timeout) => {
-                if scheduler.due(now_ms()) {
-                    let (scan_result, next_watch_set) = run_agent_scan_cycle_with_paths(
+                let now = now_ms();
+                let due_inspections = pending_inspections.take_due(now);
+                if !due_inspections.is_empty() {
+                    let mut changed = false;
+                    for inspection in due_inspections {
+                        match inspect_process(inspection.pid, &inspection.name) {
+                            Some(observed) => {
+                                changed |= apply_observed_start(
+                                    &config,
+                                    &watch_set,
+                                    &mut process_registry,
+                                    observed,
+                                );
+                            }
+                            None => pending_inspections.reschedule_after_failure(inspection, now),
+                        }
+                    }
+                    synchronize_exit_watches(
+                        &mut exit_watches,
+                        &process_registry,
+                        &pending_inspections,
+                        &sender,
+                        &shared_state,
+                        &mut publish_memory,
+                    );
+                    if changed {
+                        let scan_result = evaluate_registry_with_paths(
+                            &paths,
+                            &power_backend,
+                            &mut runtime,
+                            &config,
+                            &process_registry,
+                        );
+                        publish_scan_outcome_with_shared(
+                            &paths,
+                            scan_result,
+                            &mut publish_memory,
+                            Some(&shared_state),
+                        )?;
+                    }
+                }
+                if scheduler.due(now) {
+                    let scan_result = refresh_config_and_reconcile(
                         &paths,
                         &process_backend,
                         &power_backend,
                         &mut runtime,
+                        &mut config,
+                        &mut watch_set,
+                        &mut process_registry,
+                    );
+                    exit_watches.clear_unavailable();
+                    synchronize_exit_watches(
+                        &mut exit_watches,
+                        &process_registry,
+                        &pending_inspections,
+                        &sender,
+                        &shared_state,
+                        &mut publish_memory,
                     );
                     publish_scan_outcome_with_shared(
                         &paths,
@@ -259,13 +407,24 @@ pub fn run_agent_forever() -> Result<(), String> {
                         Some(&shared_state),
                     )?;
                     scheduler.mark_scan_completed(now_ms());
-                    watch_set = next_watch_set;
                 } else if restore_due(&runtime) || watcher_health.is_degraded() {
-                    let (scan_result, next_watch_set) = run_agent_scan_cycle_with_paths(
+                    let scan_result = refresh_config_and_reconcile(
                         &paths,
                         &process_backend,
                         &power_backend,
                         &mut runtime,
+                        &mut config,
+                        &mut watch_set,
+                        &mut process_registry,
+                    );
+                    exit_watches.clear_unavailable();
+                    synchronize_exit_watches(
+                        &mut exit_watches,
+                        &process_registry,
+                        &pending_inspections,
+                        &sender,
+                        &shared_state,
+                        &mut publish_memory,
                     );
                     publish_scan_outcome_with_shared(
                         &paths,
@@ -273,7 +432,6 @@ pub fn run_agent_forever() -> Result<(), String> {
                         &mut publish_memory,
                         Some(&shared_state),
                     )?;
-                    watch_set = next_watch_set;
                 } else {
                     publish_heartbeat_with_shared(&paths, &publish_memory, Some(&shared_state))?;
                 }
@@ -311,6 +469,7 @@ where
     result
 }
 
+#[cfg(test)]
 fn run_agent_scan_cycle_with_paths<P, W>(
     paths: &AgentPaths,
     process_backend: &P,
@@ -330,6 +489,188 @@ where
         evaluate_agent_scan_stateful(&config, process_backend, power_backend, state, now_ms());
     write_scan_event(&paths.events, &result, power_backend);
     (result, watch_set)
+}
+
+fn refresh_config_and_reconcile<P, W>(
+    paths: &AgentPaths,
+    process_backend: &P,
+    power_backend: &W,
+    state: &mut AgentRuntimeState,
+    config: &mut AppConfig,
+    watch_set: &mut AgentWatchSet,
+    registry: &mut ProcessRegistry,
+) -> Result<AgentScanResult, String>
+where
+    P: ProcessSnapshotBackend,
+    W: PowerManagerBackend,
+{
+    let next_config = load_or_create_config(paths.config.clone())?;
+    let next_watch_set = AgentWatchSet::from_config(&next_config);
+    *config = next_config;
+    *watch_set = next_watch_set;
+    let result = reconcile_process_registry(
+        config,
+        watch_set,
+        process_backend,
+        power_backend,
+        state,
+        registry,
+    );
+    write_scan_event(&paths.events, &result, power_backend);
+    result
+}
+
+fn reconcile_process_registry<P, W>(
+    config: &AppConfig,
+    watch_set: &AgentWatchSet,
+    process_backend: &P,
+    power_backend: &W,
+    state: &mut AgentRuntimeState,
+    registry: &mut ProcessRegistry,
+) -> Result<AgentScanResult, String>
+where
+    P: ProcessSnapshotBackend,
+    W: PowerManagerBackend,
+{
+    let tracked_processes = process_backend
+        .list_processes()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter_map(|process| tracked_process_from_snapshot(config, watch_set, process));
+    registry.replace(tracked_processes);
+    evaluate_agent_processes_stateful(
+        config,
+        &registry.processes(),
+        power_backend,
+        state,
+        now_ms(),
+    )
+}
+
+fn evaluate_registry_with_paths<W>(
+    paths: &AgentPaths,
+    power_backend: &W,
+    state: &mut AgentRuntimeState,
+    config: &AppConfig,
+    registry: &ProcessRegistry,
+) -> Result<AgentScanResult, String>
+where
+    W: PowerManagerBackend,
+{
+    let result = evaluate_agent_processes_stateful(
+        config,
+        &registry.processes(),
+        power_backend,
+        state,
+        now_ms(),
+    );
+    write_scan_event(&paths.events, &result, power_backend);
+    result
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct ProcessEventApplication {
+    changed: bool,
+    deferred_inspection: Option<(u32, String)>,
+}
+
+fn apply_process_event(
+    event: &powershift_windows::ProcessEvent,
+    config: &AppConfig,
+    watch_set: &AgentWatchSet,
+    registry: &mut ProcessRegistry,
+) -> ProcessEventApplication {
+    match event.kind {
+        powershift_windows::ProcessEventKind::Started => {
+            if !watch_set.should_observe(&event.name) {
+                return ProcessEventApplication::default();
+            }
+            let Some(observed) = inspect_process(event.pid, &event.name) else {
+                return ProcessEventApplication {
+                    changed: false,
+                    deferred_inspection: (event.pid != 0).then(|| (event.pid, event.name.clone())),
+                };
+            };
+            ProcessEventApplication {
+                changed: apply_observed_start(config, watch_set, registry, observed),
+                deferred_inspection: None,
+            }
+        }
+        powershift_windows::ProcessEventKind::Stopped => {
+            let current = inspect_process(event.pid, &event.name);
+            ProcessEventApplication {
+                changed: apply_observed_stop(config, watch_set, registry, event.pid, current),
+                deferred_inspection: None,
+            }
+        }
+    }
+}
+
+fn apply_observed_start(
+    config: &AppConfig,
+    watch_set: &AgentWatchSet,
+    registry: &mut ProcessRegistry,
+    observed: ObservedProcess,
+) -> bool {
+    tracked_process_from_observed(config, watch_set, observed)
+        .is_some_and(|process| registry.upsert(process))
+}
+
+fn apply_observed_stop(
+    config: &AppConfig,
+    watch_set: &AgentWatchSet,
+    registry: &mut ProcessRegistry,
+    pid: u32,
+    current: Option<ObservedProcess>,
+) -> bool {
+    let current_instance = current.as_ref().map(|process| &process.instance);
+    let mut changed = registry.remove_stopped_pid(pid, current_instance);
+    if let Some(process) =
+        current.and_then(|process| tracked_process_from_observed(config, watch_set, process))
+    {
+        changed |= registry.upsert(process);
+    }
+    changed
+}
+
+fn tracked_process_from_snapshot(
+    config: &AppConfig,
+    watch_set: &AgentWatchSet,
+    process: ProcessInfo,
+) -> Option<TrackedProcess> {
+    if !watch_set.should_observe(&process.name) {
+        return None;
+    }
+
+    let observed = inspect_process(process.pid, &process.name).unwrap_or(ObservedProcess {
+        instance: ProcessInstanceId {
+            pid: process.pid,
+            creation_time: 0,
+        },
+        process,
+        session_id: None,
+    });
+    tracked_process_from_observed(config, watch_set, observed)
+}
+
+fn tracked_process_from_observed(
+    config: &AppConfig,
+    watch_set: &AgentWatchSet,
+    observed: ObservedProcess,
+) -> Option<TrackedProcess> {
+    if observed.session_id == Some(0) {
+        return None;
+    }
+    if !watch_set.should_observe(&observed.process.name) {
+        return None;
+    }
+    let process = DetectedProcess {
+        pid: observed.process.pid,
+        name: observed.process.name,
+        path: observed.process.path,
+    };
+    process_matches_enabled_profile(config, &process)
+        .then(|| TrackedProcess::new(observed.instance, process))
 }
 
 pub fn evaluate_agent_scan_stateful<P, W>(
@@ -353,11 +694,24 @@ where
             path: process.path,
         })
         .collect::<Vec<_>>();
+    evaluate_agent_processes_stateful(config, &processes, power_backend, state, now_ms)
+}
+
+fn evaluate_agent_processes_stateful<W>(
+    config: &AppConfig,
+    processes: &[DetectedProcess],
+    power_backend: &W,
+    state: &mut AgentRuntimeState,
+    now_ms: u64,
+) -> Result<AgentScanResult, String>
+where
+    W: PowerManagerBackend,
+{
     let active_plan = power_backend
         .active_plan()
         .map_err(|error| error.to_string())?;
 
-    let active_profiles = resolve_active_profiles(config, &processes);
+    let active_profiles = resolve_active_profiles(config, processes);
 
     if let Some(winner) =
         choose_winning_profile(&active_profiles, state.winning_profile_id.as_deref())
@@ -568,7 +922,7 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use powershift_core::{PowerPlan, ProcessInfo, Profile};
-    use powershift_windows::{PowerError, PowerResult, ProcessEvent, ProcessEventKind};
+    use powershift_windows::{PowerError, PowerResult};
     use std::cell::RefCell;
 
     struct FakeProcessBackend {
@@ -642,25 +996,16 @@ mod tests {
         }
     }
 
-    fn process_event(name: &str) -> ProcessEvent {
-        process_event_with_kind(name, ProcessEventKind::Started)
-    }
-
-    fn process_stopped_event(name: &str) -> ProcessEvent {
-        process_event_with_kind(name, ProcessEventKind::Stopped)
-    }
-
-    fn process_event_with_kind(name: &str, kind: ProcessEventKind) -> ProcessEvent {
-        ProcessEvent {
-            kind,
-            pid: 42,
-            name: name.to_string(),
-            path: None,
+    fn observed(pid: u32, creation_time: u64, name: &str) -> ObservedProcess {
+        ObservedProcess {
+            instance: ProcessInstanceId { pid, creation_time },
+            process: ProcessInfo {
+                pid,
+                name: name.to_string(),
+                path: None,
+            },
+            session_id: Some(1),
         }
-    }
-
-    fn active_ids(ids: &[&str]) -> BTreeSet<String> {
-        ids.iter().map(|id| id.to_string()).collect()
     }
 
     fn temp_agent_paths(name: &str) -> AgentPaths {
@@ -700,6 +1045,127 @@ mod tests {
             .profiles
             .contains("game"));
         let _ = std::fs::remove_dir_all(paths.state.parent().expect("state parent"));
+    }
+
+    #[test]
+    fn tracked_exit_updates_only_the_closed_profile_without_a_snapshot_scan() {
+        let config = multi_profile_config();
+        let watch_set = AgentWatchSet::from_config(&config);
+        let chrome = observed(10, 100, "chrome.exe");
+        let game = observed(20, 200, "game.exe");
+        let mut registry = ProcessRegistry::default();
+
+        assert!(apply_observed_start(
+            &config,
+            &watch_set,
+            &mut registry,
+            chrome.clone(),
+        ));
+        assert!(apply_observed_start(
+            &config,
+            &watch_set,
+            &mut registry,
+            game.clone(),
+        ));
+
+        let mut state = AgentRuntimeState::default();
+        let first = evaluate_agent_processes_stateful(
+            &config,
+            &registry.processes(),
+            &power("balanced"),
+            &mut state,
+            1,
+        )
+        .expect("evaluate both active profiles");
+        assert_eq!(first.matched_profile_id.as_deref(), Some("game"));
+
+        assert!(registry.remove_exact(&game.instance));
+        let power = power("high");
+        let after_exit = evaluate_agent_processes_stateful(
+            &config,
+            &registry.processes(),
+            &power,
+            &mut state,
+            2,
+        )
+        .expect("evaluate exact tracked exit");
+
+        assert_eq!(after_exit.matched_profile_id.as_deref(), Some("chrome"));
+        assert_eq!(
+            power.set_calls.borrow().as_slice(),
+            &["balanced".to_string()]
+        );
+    }
+
+    #[test]
+    fn stale_wmi_stop_cannot_remove_a_reused_pid_instance() {
+        let config = config();
+        let watch_set = AgentWatchSet::from_config(&config);
+        let old = observed(42, 100, "demo.exe");
+        let current = observed(42, 200, "demo.exe");
+        let mut registry = ProcessRegistry::default();
+
+        assert!(apply_observed_start(
+            &config,
+            &watch_set,
+            &mut registry,
+            old
+        ));
+        assert!(apply_observed_stop(
+            &config,
+            &watch_set,
+            &mut registry,
+            42,
+            Some(current.clone()),
+        ));
+
+        assert!(registry.contains(&current.instance));
+        assert_eq!(registry.processes()[0].pid, 42);
+    }
+
+    #[test]
+    fn stop_without_a_live_pid_removes_the_tracked_process_immediately() {
+        let config = config();
+        let watch_set = AgentWatchSet::from_config(&config);
+        let tracked = observed(42, 100, "demo.exe");
+        let mut registry = ProcessRegistry::default();
+        apply_observed_start(&config, &watch_set, &mut registry, tracked);
+
+        assert!(apply_observed_stop(
+            &config,
+            &watch_set,
+            &mut registry,
+            42,
+            None,
+        ));
+        assert!(registry.processes().is_empty());
+    }
+
+    #[test]
+    fn service_session_processes_cannot_activate_user_profiles() {
+        let config = config();
+        let watch_set = AgentWatchSet::from_config(&config);
+        let mut registry = ProcessRegistry::default();
+        let service_process = ObservedProcess {
+            instance: ProcessInstanceId {
+                pid: 77,
+                creation_time: 100,
+            },
+            process: ProcessInfo {
+                pid: 77,
+                name: "demo.exe".to_string(),
+                path: None,
+            },
+            session_id: Some(0),
+        };
+
+        assert!(!apply_observed_start(
+            &config,
+            &watch_set,
+            &mut registry,
+            service_process,
+        ));
+        assert!(registry.processes().is_empty());
     }
 
     #[test]
@@ -759,6 +1225,7 @@ mod tests {
             updated_at_ms: 123,
             last_scan: Some(active_scan()),
             last_error: None,
+            process_tracking: ProcessTrackingStatus::default(),
         };
         let shared = shared_state_with(state.clone());
         let (sender, _receiver) = mpsc::channel();
@@ -784,6 +1251,7 @@ mod tests {
             updated_at_ms: 123,
             last_scan: None,
             last_error: None,
+            process_tracking: ProcessTrackingStatus::default(),
         });
         let (sender, receiver) = mpsc::channel();
         let request = serde_json::to_string(&AgentIpcRequest::Reevaluate {
@@ -1106,7 +1574,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_set_uses_broad_wake_for_folder_matchers() {
+    fn watch_set_observes_all_names_for_folder_matchers() {
         let mut profile = Profile::new("folder-game", "Folder Game", "launcher.exe", "high");
         profile.activation.require_main_process = false;
         profile
@@ -1122,7 +1590,7 @@ mod tests {
         });
 
         let affected = watch_set.affected_profiles("unexpected-helper.exe");
-        assert!(affected.broad_only);
+        assert!(watch_set.should_observe("unexpected-helper.exe"));
         assert_eq!(
             affected.profiles,
             BTreeSet::from(["folder-game".to_string()])
@@ -1140,154 +1608,6 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_ignores_unconfigured_process_events() {
-        let watch_set = AgentWatchSet::from_config(&multi_profile_config());
-        let mut scheduler = AgentScanScheduler::default();
-
-        let scheduled = scheduler.record_process_event(
-            &process_event("notepad.exe"),
-            &watch_set,
-            &BTreeSet::new(),
-            1_000,
-        );
-
-        assert!(!scheduled);
-        assert_eq!(scheduler.next_wait(1_000), None);
-    }
-
-    #[test]
-    fn scheduler_coalesces_process_event_bursts() {
-        let watch_set = AgentWatchSet::from_config(&multi_profile_config());
-        let mut scheduler = AgentScanScheduler::default();
-
-        assert!(scheduler.record_process_event(
-            &process_event("game.exe"),
-            &watch_set,
-            &BTreeSet::new(),
-            1_000,
-        ));
-        assert_eq!(scheduler.next_wait(1_000), Some(PROCESS_EVENT_DEBOUNCE));
-
-        scheduler.record_process_event(
-            &process_event("game.exe"),
-            &watch_set,
-            &BTreeSet::new(),
-            1_400,
-        );
-        assert_eq!(scheduler.next_wait(1_400), Some(PROCESS_EVENT_DEBOUNCE));
-
-        scheduler.record_process_event(
-            &process_event("game.exe"),
-            &watch_set,
-            &BTreeSet::new(),
-            2_900,
-        );
-        assert_eq!(scheduler.next_wait(2_900), Some(Duration::from_millis(100)));
-        assert!(scheduler.due(3_000));
-    }
-
-    #[test]
-    fn scheduler_ignores_started_events_for_already_active_profiles() {
-        let watch_set = AgentWatchSet::from_config(&multi_profile_config());
-        let mut scheduler = AgentScanScheduler::default();
-
-        let scheduled = scheduler.record_process_event(
-            &process_event("chrome.exe"),
-            &watch_set,
-            &active_ids(&["chrome"]),
-            1_200,
-        );
-
-        assert!(!scheduled);
-        assert_eq!(scheduler.next_wait(1_200), None);
-    }
-
-    #[test]
-    fn scheduler_coalesces_stopped_events_for_active_profiles_until_quiet() {
-        let watch_set = AgentWatchSet::from_config(&multi_profile_config());
-        let mut scheduler = AgentScanScheduler::default();
-
-        assert!(scheduler.record_process_event(
-            &process_stopped_event("chrome.exe"),
-            &watch_set,
-            &active_ids(&["chrome"]),
-            1_000,
-        ));
-        assert_eq!(scheduler.next_wait(1_000), Some(PROCESS_EVENT_DEBOUNCE));
-
-        scheduler.record_process_event(
-            &process_stopped_event("chrome.exe"),
-            &watch_set,
-            &active_ids(&["chrome"]),
-            1_500,
-        );
-        assert_eq!(scheduler.next_wait(1_500), Some(PROCESS_EVENT_DEBOUNCE));
-
-        scheduler.record_process_event(
-            &process_stopped_event("chrome.exe"),
-            &watch_set,
-            &active_ids(&["chrome"]),
-            3_900,
-        );
-        assert_eq!(scheduler.next_wait(3_900), Some(Duration::from_millis(100)));
-        assert!(scheduler.due(4_000));
-    }
-
-    #[test]
-    fn scheduler_scans_soon_for_inactive_profile_start_events() {
-        let watch_set = AgentWatchSet::from_config(&multi_profile_config());
-        let mut scheduler = AgentScanScheduler::default();
-
-        scheduler.record_process_event(
-            &process_event("game.exe"),
-            &watch_set,
-            &active_ids(&["chrome"]),
-            1_200,
-        );
-
-        assert_eq!(scheduler.next_wait(1_200), Some(PROCESS_EVENT_DEBOUNCE));
-    }
-
-    #[test]
-    fn scheduler_throttles_broad_folder_wakes() {
-        let mut profile = Profile::new("folder-game", "Folder Game", "launcher.exe", "high");
-        profile.activation.require_main_process = false;
-        profile
-            .associated_processes
-            .push(powershift_core::ProcessMatcher {
-                name: String::new(),
-                path: Some("D:\\Games\\Folder".to_string()),
-                match_mode: powershift_core::MatchMode::Folder,
-            });
-        let watch_set = AgentWatchSet::from_config(&AppConfig {
-            profiles: vec![profile],
-            ..AppConfig::default()
-        });
-        let mut scheduler = AgentScanScheduler::default();
-
-        assert!(scheduler.record_process_event(
-            &process_event("unrelated.exe"),
-            &watch_set,
-            &BTreeSet::new(),
-            1_000,
-        ));
-        scheduler.mark_scan_completed(1_750);
-
-        assert!(!scheduler.record_process_event(
-            &process_event("another.exe"),
-            &watch_set,
-            &BTreeSet::new(),
-            2_000,
-        ));
-        assert!(scheduler.record_process_event(
-            &process_event("later.exe"),
-            &watch_set,
-            &BTreeSet::new(),
-            7_000,
-        ));
-    }
-
-    #[test]
     fn scheduler_throttles_public_wake_events() {
         let mut scheduler = AgentScanScheduler::default();
 
@@ -1298,55 +1618,7 @@ mod tests {
         assert!(!scheduler.record_public_wake(1_500));
         assert_eq!(scheduler.next_wait(1_500), None);
 
-        assert!(scheduler.record_public_wake(1_000 + duration_ms(PUBLIC_WAKE_EVENT_COOLDOWN)));
-    }
-
-    #[test]
-    fn scheduler_ignores_stopped_events_for_inactive_profiles() {
-        let watch_set = AgentWatchSet::from_config(&multi_profile_config());
-        let mut scheduler = AgentScanScheduler::default();
-
-        let scheduled = scheduler.record_process_event(
-            &process_stopped_event("game.exe"),
-            &watch_set,
-            &active_ids(&["chrome"]),
-            1_200,
-        );
-
-        assert!(!scheduled);
-        assert_eq!(scheduler.next_wait(1_200), None);
-    }
-
-    #[test]
-    fn scheduler_scans_on_unknown_stop_while_any_profile_is_active() {
-        let watch_set = AgentWatchSet::from_config(&multi_profile_config());
-        let mut scheduler = AgentScanScheduler::default();
-
-        let scheduled = scheduler.record_process_event(
-            &process_stopped_event("fortnite-helper.exe"),
-            &watch_set,
-            &active_ids(&["game"]),
-            1_200,
-        );
-
-        assert!(scheduled);
-        assert_eq!(scheduler.next_wait(1_200), Some(PROCESS_EVENT_DEBOUNCE));
-    }
-
-    #[test]
-    fn scheduler_ignores_unknown_stop_when_no_profile_is_active() {
-        let watch_set = AgentWatchSet::from_config(&multi_profile_config());
-        let mut scheduler = AgentScanScheduler::default();
-
-        let scheduled = scheduler.record_process_event(
-            &process_stopped_event("fortnite-helper.exe"),
-            &watch_set,
-            &BTreeSet::new(),
-            1_200,
-        );
-
-        assert!(!scheduled);
-        assert_eq!(scheduler.next_wait(1_200), None);
+        assert!(scheduler.record_public_wake(3_000));
     }
 
     #[test]
@@ -1515,11 +1787,32 @@ mod tests {
     }
 
     #[test]
+    fn scan_publish_preserves_process_tracking_status() {
+        let paths = temp_agent_paths("scan-publish-tracking");
+        let tracking = ProcessTrackingStatus {
+            tracked_instances: 3,
+            registered_exit_waits: 2,
+            unavailable_exit_waits: 1,
+            pending_targeted_inspections: 0,
+        };
+        let mut memory = AgentPublishMemory {
+            process_tracking: tracking.clone(),
+            ..AgentPublishMemory::default()
+        };
+
+        publish_scan_outcome(&paths, Ok(active_scan()), &mut memory).expect("publish scan");
+
+        assert_eq!(read_published_state(&paths).process_tracking, tracking);
+        let _ = std::fs::remove_dir_all(paths.state.parent().expect("state parent"));
+    }
+
+    #[test]
     fn process_watcher_error_keeps_last_successful_scan() {
         let paths = temp_agent_paths("watcher-error-memory");
         let mut memory = AgentPublishMemory {
             last_scan: Some(active_scan()),
             last_error: None,
+            process_tracking: ProcessTrackingStatus::default(),
         };
 
         publish_error(&paths, "HRESULT Call failed with: 0x80041003", &mut memory)
@@ -1543,6 +1836,12 @@ mod tests {
         let memory = AgentPublishMemory {
             last_scan: Some(active_scan()),
             last_error: None,
+            process_tracking: ProcessTrackingStatus {
+                tracked_instances: 3,
+                registered_exit_waits: 3,
+                unavailable_exit_waits: 0,
+                pending_targeted_inspections: 0,
+            },
         };
         let shared = AgentSharedState::default();
 
@@ -1552,6 +1851,7 @@ mod tests {
         assert_eq!(state.status, AgentStatus::Running);
         assert_eq!(state.last_scan, Some(active_scan()));
         assert_eq!(state.last_error, None);
+        assert_eq!(state.process_tracking, memory.process_tracking);
         assert!(!paths.state.exists());
 
         let _ = std::fs::remove_dir_all(paths.state.parent().expect("state parent"));
@@ -1566,6 +1866,7 @@ mod tests {
             updated_at_ms: 1,
             last_scan: Some(active_scan()),
             last_error: None,
+            process_tracking: ProcessTrackingStatus::default(),
         };
         let temp_path = paths
             .state
@@ -1596,6 +1897,7 @@ mod tests {
                 updated_at_ms: 1,
                 last_scan: None,
                 last_error: None,
+                process_tracking: ProcessTrackingStatus::default(),
             },
         )
         .expect("publish state");

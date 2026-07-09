@@ -1,3 +1,4 @@
+use crate::ProcessInstanceId;
 use std::sync::mpsc::Sender;
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -39,6 +40,7 @@ impl ProcessWatcherKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessWatchMessage {
     Event(ProcessEvent),
+    TrackedProcessExited(ProcessInstanceId),
     Error(String),
     WatcherHealthy(ProcessWatcherKind),
     WatcherDegraded {

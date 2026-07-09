@@ -102,19 +102,25 @@ tight loop.
 
 Current flow:
 
-1. Windows WMI process events wake the agent.
-2. The agent performs a debounced scan only when useful.
-3. The scan resolves active profiles using process name, path, or folder rules.
-4. The highest-priority active profile controls the power plan.
-5. When profiles close, PowerShift restores the configured plan.
+1. At startup, explicit reevaluation, configuration changes, or degraded WMI,
+   the agent performs one reconciliation snapshot.
+2. A WMI start event is prefiltered by configured executable names, then only
+   that PID is inspected for its path and creation time. If Windows has not
+   made the handle available yet, PowerShift retries that exact PID after 150
+   ms and once more after 1 s; it never turns that race into a global scan.
+3. Matching instances live in an in-memory registry keyed by `PID + creation
+   time`, which prevents PID reuse from corrupting state.
+4. Windows thread-pool wait handles report the exit of each tracked instance
+   directly. WMI stop events remain a secondary safety signal.
+5. The registry is re-evaluated in memory; an unrelated process closing does
+   not trigger a whole process-table scan.
+6. The highest-priority active profile controls the power plan. Once no
+   profiles remain, PowerShift follows the configured restore behavior.
 
-Known improvement planned:
-
-- Track active PIDs from scan results.
-- Use WMI stop events by PID to wake scans more precisely.
-- Keep the current broad close-event fallback only as a safety net.
-- Avoid hooks, injection, memory reads, process modification, or direct game
-  interaction.
+The normal path uses no process polling, hooks, injection, memory reads,
+process modification, or direct interaction with games or anti-cheat systems.
+If WMI is degraded, the agent uses a bounded reconciliation fallback while the
+native exit waits keep tracking already-known processes.
 
 ## Installation
 

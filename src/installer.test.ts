@@ -38,6 +38,10 @@ describe('installer background architecture', () => {
     expect(postInstall).toContain('-AllowStartIfOnBatteries');
     expect(postInstall).toContain('-DontStopIfGoingOnBatteries');
     expect(postInstall).toContain('-RunLevel Highest');
+    expect(postInstall).toContain('-ExecutionTimeLimit ([TimeSpan]::Zero)');
+    expect(postInstall).toContain('-RestartCount 3');
+    expect(postInstall).toContain('-RestartInterval (New-TimeSpan -Minutes 1)');
+    expect(postInstall).not.toContain('New-TimeSpan -Days');
     expect(postInstall).not.toContain('schtasks /Create');
     expect(postInstall).not.toContain('/TR');
     expect(postInstall).toContain('schtasks /Run /TN "PowerShiftAgent"');

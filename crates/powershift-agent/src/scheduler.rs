@@ -3,12 +3,11 @@ use powershift_core::AppConfig;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-pub(crate) const PROCESS_EVENT_DEBOUNCE: Duration = Duration::from_millis(750);
-pub(crate) const PROCESS_EVENT_MAX_COALESCE: Duration = Duration::from_secs(2);
-pub(crate) const ACTIVE_PROCESS_STOP_MAX_COALESCE: Duration = Duration::from_secs(3);
 pub(crate) const DEGRADED_PROCESS_SCAN_INTERVAL: Duration = Duration::from_secs(30);
-pub(crate) const FOLDER_BROAD_WAKE_COOLDOWN: Duration = Duration::from_secs(5);
 pub(crate) const PUBLIC_WAKE_EVENT_COOLDOWN: Duration = Duration::from_secs(2);
+
+const TARGETED_INSPECTION_RETRY_DELAYS: [Duration; 2] =
+    [Duration::from_millis(150), Duration::from_secs(1)];
 
 const AGENT_WAKE_PROCESS_NAME: &str = "agent_wake";
 
@@ -21,7 +20,6 @@ pub(crate) struct AgentWatchSet {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct AffectedWatchProfiles {
     pub(crate) profiles: BTreeSet<String>,
-    pub(crate) broad_only: bool,
 }
 
 impl AffectedWatchProfiles {
@@ -76,10 +74,14 @@ impl AgentWatchSet {
         if !exact_profiles.is_empty() {
             profiles.extend(exact_profiles.iter().cloned());
         }
-        AffectedWatchProfiles {
-            broad_only: !self.broad_profiles.is_empty() && exact_profiles.is_empty(),
-            profiles,
-        }
+        AffectedWatchProfiles { profiles }
+    }
+
+    /// Fast name prefilter before asking Windows for metadata about a single
+    /// PID. Folder matchers intentionally return true for every name because
+    /// only the executable path can decide that match.
+    pub(crate) fn should_observe(&self, process_name: &str) -> bool {
+        !self.affected_profiles(process_name).profiles.is_empty()
     }
 
     #[cfg(test)]
@@ -91,25 +93,111 @@ impl AgentWatchSet {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct AgentScanScheduler {
     pending: Option<PendingScheduledScan>,
-    last_broad_wake_ms: Option<u64>,
     last_public_wake_ms: Option<u64>,
+}
+
+/// A bounded retry queue for a WMI start event whose process handle is not
+/// ready yet. It inspects only that PID; it never enumerates all processes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct TargetedInspectionQueue {
+    pending: BTreeMap<u32, PendingTargetedInspection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DueTargetedInspection {
+    pub(crate) pid: u32,
+    pub(crate) name: String,
+    attempt: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingTargetedInspection {
+    name: String,
+    attempt: usize,
+    due_at_ms: u64,
+}
+
+impl TargetedInspectionQueue {
+    pub(crate) fn schedule_initial(&mut self, pid: u32, name: impl Into<String>, now_ms: u64) {
+        if pid == 0 {
+            return;
+        }
+        self.pending.insert(
+            pid,
+            PendingTargetedInspection {
+                name: name.into(),
+                attempt: 0,
+                due_at_ms: now_ms + TARGETED_INSPECTION_RETRY_DELAYS[0].as_millis() as u64,
+            },
+        );
+    }
+
+    pub(crate) fn take_due(&mut self, now_ms: u64) -> Vec<DueTargetedInspection> {
+        let due_pids = self
+            .pending
+            .iter()
+            .filter_map(|(pid, pending)| (pending.due_at_ms <= now_ms).then_some(*pid))
+            .collect::<Vec<_>>();
+        due_pids
+            .into_iter()
+            .filter_map(|pid| {
+                self.pending
+                    .remove(&pid)
+                    .map(|pending| DueTargetedInspection {
+                        pid,
+                        name: pending.name,
+                        attempt: pending.attempt,
+                    })
+            })
+            .collect()
+    }
+
+    pub(crate) fn reschedule_after_failure(
+        &mut self,
+        inspection: DueTargetedInspection,
+        now_ms: u64,
+    ) {
+        let next_attempt = inspection.attempt + 1;
+        let Some(delay) = TARGETED_INSPECTION_RETRY_DELAYS.get(next_attempt) else {
+            return;
+        };
+        self.pending.insert(
+            inspection.pid,
+            PendingTargetedInspection {
+                name: inspection.name,
+                attempt: next_attempt,
+                due_at_ms: now_ms + delay.as_millis() as u64,
+            },
+        );
+    }
+
+    pub(crate) fn remove(&mut self, pid: u32) {
+        self.pending.remove(&pid);
+    }
+
+    pub(crate) fn next_wait(&self, now_ms: u64) -> Option<Duration> {
+        self.pending
+            .values()
+            .map(|pending| Duration::from_millis(pending.due_at_ms.saturating_sub(now_ms)))
+            .min()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingScheduledScan {
-    first_seen_ms: u64,
     due_at_ms: u64,
     force: bool,
-    broad: bool,
 }
 
 impl AgentScanScheduler {
     pub(crate) fn schedule_forced(&mut self, now_ms: u64) {
         self.pending = Some(PendingScheduledScan {
-            first_seen_ms: now_ms,
             due_at_ms: now_ms,
             force: true,
-            broad: false,
         });
     }
 
@@ -120,50 +208,6 @@ impl AgentScanScheduler {
 
         self.last_public_wake_ms = Some(now_ms);
         self.schedule_forced(now_ms);
-        true
-    }
-
-    pub(crate) fn record_process_event(
-        &mut self,
-        event: &powershift_windows::ProcessEvent,
-        watch_set: &AgentWatchSet,
-        active_profile_ids: &BTreeSet<String>,
-        now_ms: u64,
-    ) -> bool {
-        let affected = watch_set.affected_profiles(&event.name);
-        if affected.profiles.is_empty() {
-            if event.kind == powershift_windows::ProcessEventKind::Stopped
-                && !active_profile_ids.is_empty()
-            {
-                self.schedule_debounced_scan(PROCESS_EVENT_MAX_COALESCE, false, now_ms);
-                return true;
-            }
-            return false;
-        }
-        if affected.broad_only && self.broad_wake_on_cooldown(now_ms) {
-            return false;
-        }
-
-        let affects_inactive_profile = affected
-            .profiles
-            .iter()
-            .any(|profile_id| !active_profile_ids.contains(profile_id));
-        let affects_active_profile = affected
-            .profiles
-            .iter()
-            .any(|profile_id| active_profile_ids.contains(profile_id));
-
-        let max_coalesce = match event.kind {
-            powershift_windows::ProcessEventKind::Started if !affects_inactive_profile => {
-                return false;
-            }
-            powershift_windows::ProcessEventKind::Stopped if !affects_active_profile => {
-                return false;
-            }
-            powershift_windows::ProcessEventKind::Stopped => ACTIVE_PROCESS_STOP_MAX_COALESCE,
-            powershift_windows::ProcessEventKind::Started => PROCESS_EVENT_MAX_COALESCE,
-        };
-        self.schedule_debounced_scan(max_coalesce, affected.broad_only, now_ms);
         true
     }
 
@@ -179,40 +223,14 @@ impl AgentScanScheduler {
             .map(|pending| Duration::from_millis(pending.due_at_ms.saturating_sub(now_ms)))
     }
 
-    pub(crate) fn mark_scan_completed(&mut self, now_ms: u64) {
-        if self.pending.as_ref().is_some_and(|pending| pending.broad) {
-            self.last_broad_wake_ms = Some(now_ms);
-        }
+    pub(crate) fn mark_scan_completed(&mut self, _now_ms: u64) {
         self.pending = None;
-    }
-
-    fn broad_wake_on_cooldown(&self, now_ms: u64) -> bool {
-        self.last_broad_wake_ms.is_some_and(|last| {
-            now_ms.saturating_sub(last) < duration_ms(FOLDER_BROAD_WAKE_COOLDOWN)
-        })
     }
 
     fn public_wake_on_cooldown(&self, now_ms: u64) -> bool {
         self.last_public_wake_ms.is_some_and(|last| {
-            now_ms.saturating_sub(last) < duration_ms(PUBLIC_WAKE_EVENT_COOLDOWN)
+            now_ms.saturating_sub(last) < PUBLIC_WAKE_EVENT_COOLDOWN.as_millis() as u64
         })
-    }
-
-    fn schedule_debounced_scan(&mut self, max_coalesce: Duration, broad: bool, now_ms: u64) {
-        let first_seen_ms = self
-            .pending
-            .as_ref()
-            .map(|pending| pending.first_seen_ms)
-            .unwrap_or(now_ms);
-        let mut due_at_ms = now_ms + duration_ms(PROCESS_EVENT_DEBOUNCE);
-        due_at_ms = due_at_ms.min(first_seen_ms + duration_ms(max_coalesce));
-
-        self.pending = Some(PendingScheduledScan {
-            first_seen_ms,
-            due_at_ms,
-            force: false,
-            broad,
-        });
     }
 }
 
@@ -233,10 +251,6 @@ pub(crate) fn next_wait_with_scheduler(
         .unwrap_or(base)
 }
 
-pub(crate) fn active_profile_id_set(state: &AgentRuntimeState) -> BTreeSet<String> {
-    state.active_profile_ids.iter().cloned().collect()
-}
-
 pub(crate) fn is_agent_wake_event(event: &powershift_windows::ProcessEvent) -> bool {
     event.pid == 0 && normalize_process_name(&event.name) == AGENT_WAKE_PROCESS_NAME
 }
@@ -248,10 +262,6 @@ pub(crate) fn agent_wake_event() -> powershift_windows::ProcessEvent {
         name: AGENT_WAKE_PROCESS_NAME.to_string(),
         path: None,
     }
-}
-
-pub(crate) fn duration_ms(duration: Duration) -> u64 {
-    duration.as_millis().try_into().unwrap_or(u64::MAX)
 }
 
 fn add_profile_executable(
@@ -331,4 +341,42 @@ fn file_name_from_path(path: &str) -> Option<String> {
 
 fn normalize_process_name(input: &str) -> String {
     input.trim().to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn targeted_inspection_retries_only_the_original_pid_and_is_bounded() {
+        let mut queue = TargetedInspectionQueue::default();
+        queue.schedule_initial(42, "game.exe", 1_000);
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.next_wait(1_000), Some(Duration::from_millis(150)));
+        assert!(queue.take_due(1_149).is_empty());
+
+        let first = queue.take_due(1_150);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].pid, 42);
+        assert_eq!(first[0].name, "game.exe");
+        queue.reschedule_after_failure(first.into_iter().next().expect("first retry"), 1_150);
+
+        assert_eq!(queue.next_wait(1_150), Some(Duration::from_secs(1)));
+        let second = queue.take_due(2_150);
+        assert_eq!(second.len(), 1);
+        queue.reschedule_after_failure(second.into_iter().next().expect("second retry"), 2_150);
+
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn stop_event_can_cancel_a_targeted_inspection_before_it_runs() {
+        let mut queue = TargetedInspectionQueue::default();
+        queue.schedule_initial(42, "game.exe", 1_000);
+
+        queue.remove(42);
+
+        assert!(queue.take_due(10_000).is_empty());
+    }
 }

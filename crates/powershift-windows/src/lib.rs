@@ -27,10 +27,12 @@ pub use ipc_events::{
 pub use manager::{PowerManager, PowerManagerBackend};
 pub use named_pipe::{
     agent_pipe_name, call_named_pipe, run_named_pipe_server, AGENT_PIPE_NAME_PREFIX,
-    AGENT_PIPE_SDDL,
 };
 pub use powercfg::{parse_powercfg_list, PowerCfgBackend};
-pub use process::{process_id_is_running, ProcessSnapshotBackend, SystemProcessBackend};
+pub use process::{
+    inspect_process, process_id_is_running, register_process_exit_wait, ObservedProcess,
+    ProcessExitWatch, ProcessInstanceId, ProcessSnapshotBackend, SystemProcessBackend,
+};
 pub use process_events::{
     spawn_process_event_watchers, ProcessEvent, ProcessEventKind, ProcessWatchMessage,
     ProcessWatcherKind,

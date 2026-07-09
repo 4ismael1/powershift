@@ -1,9 +1,12 @@
 use crate::PowerResult;
 
 pub const AGENT_PIPE_NAME_PREFIX: &str = r"\\.\pipe\PowerShiftAgent";
-pub const AGENT_PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+const AGENT_PIPE_SDDL_PREFIX: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)";
 const PIPE_BUFFER_BYTES: u32 = 256 * 1024;
 const PIPE_CLIENT_TIMEOUT_MS: u32 = 1_500;
+const PIPE_REQUEST_MAX_BYTES: usize = 64 * 1024;
+const PIPE_REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const PIPE_REQUEST_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
 pub fn agent_pipe_name() -> String {
     format!("{AGENT_PIPE_NAME_PREFIX}-{}", current_session_id())
@@ -33,6 +36,11 @@ pub fn call_named_pipe(pipe_name: &str, request: &str) -> PowerResult<String> {
     use windows::Win32::System::Pipes::CallNamedPipeW;
 
     let request = request.as_bytes();
+    if request.len() > PIPE_REQUEST_MAX_BYTES {
+        return Err(crate::PowerError::Parse(format!(
+            "named pipe request exceeds {PIPE_REQUEST_MAX_BYTES} bytes"
+        )));
+    }
     let mut response = vec![0_u8; PIPE_BUFFER_BYTES as usize];
     let mut bytes_read = 0_u32;
     let ok = unsafe {
@@ -65,11 +73,10 @@ where
     loop {
         let (_descriptor, attributes) = named_pipe_security_attributes()?;
         let handle = create_server_pipe(pipe_name, &attributes)?;
-        let result = serve_one_client(handle, &mut handler);
+        let _ = serve_one_client(handle, &mut handler);
         unsafe {
             let _ = windows::Win32::Foundation::CloseHandle(handle);
         }
-        result?;
     }
 }
 
@@ -120,7 +127,6 @@ where
     let response = handler(request);
     write_pipe_message(handle, &response)?;
     unsafe {
-        let _ = windows::Win32::Storage::FileSystem::FlushFileBuffers(handle);
         let _ = windows::Win32::System::Pipes::DisconnectNamedPipe(handle);
     }
     Ok(())
@@ -147,14 +153,34 @@ fn connect_pipe_client(handle: windows::Win32::Foundation::HANDLE) -> PowerResul
 fn read_pipe_message(handle: windows::Win32::Foundation::HANDLE) -> PowerResult<String> {
     use windows::Win32::Foundation::{GetLastError, ERROR_MORE_DATA};
     use windows::Win32::Storage::FileSystem::ReadFile;
+    use windows::Win32::System::Pipes::PeekNamedPipe;
 
     let mut output = Vec::new();
+    let deadline = std::time::Instant::now() + PIPE_REQUEST_READ_TIMEOUT;
     loop {
+        let mut bytes_available = 0_u32;
+        unsafe { PeekNamedPipe(handle, None, 0, None, Some(&mut bytes_available), None) }
+            .map_err(|error| crate::PowerError::Parse(error.to_string()))?;
+        if bytes_available == 0 {
+            if std::time::Instant::now() >= deadline {
+                return Err(crate::PowerError::Parse(
+                    "named pipe request timed out".to_string(),
+                ));
+            }
+            std::thread::sleep(PIPE_REQUEST_POLL_INTERVAL);
+            continue;
+        }
+
         let mut chunk = vec![0_u8; 8192];
         let mut bytes_read = 0_u32;
         let result = unsafe { ReadFile(handle, Some(&mut chunk), Some(&mut bytes_read), None) };
         chunk.truncate(bytes_read as usize);
         output.extend_from_slice(&chunk);
+        if output.len() > PIPE_REQUEST_MAX_BYTES {
+            return Err(crate::PowerError::Parse(format!(
+                "named pipe request exceeds {PIPE_REQUEST_MAX_BYTES} bytes"
+            )));
+        }
 
         match result {
             Ok(()) => break,
@@ -216,10 +242,11 @@ fn named_pipe_security_attributes() -> PowerResult<(
     };
     use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 
+    let sddl = agent_pipe_security_descriptor()?;
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            &HSTRING::from(AGENT_PIPE_SDDL),
+            &HSTRING::from(sddl),
             SDDL_REVISION_1,
             &mut descriptor,
             None,
@@ -234,6 +261,65 @@ fn named_pipe_security_attributes() -> PowerResult<(
     };
 
     Ok((LocalSecurityDescriptor(descriptor), attributes))
+}
+
+#[cfg(windows)]
+fn agent_pipe_security_descriptor() -> PowerResult<String> {
+    Ok(format!(
+        "{AGENT_PIPE_SDDL_PREFIX}(A;;GRGW;;;{})",
+        current_user_sid_string()?
+    ))
+}
+
+#[cfg(windows)]
+fn current_user_sid_string() -> PowerResult<String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL};
+    use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = HANDLE::default();
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }
+        .map_err(|error| crate::PowerError::Parse(error.to_string()))?;
+
+    let result = (|| {
+        let mut required_bytes = 0_u32;
+        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut required_bytes) };
+        if required_bytes == 0 {
+            return Err(crate::PowerError::Parse(
+                "GetTokenInformation returned an empty user token".to_string(),
+            ));
+        }
+
+        let mut buffer = vec![0_u8; required_bytes as usize];
+        unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buffer.as_mut_ptr().cast()),
+                required_bytes,
+                &mut required_bytes,
+            )
+        }
+        .map_err(|error| crate::PowerError::Parse(error.to_string()))?;
+
+        let token_user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+        let mut sid_string = PWSTR::null();
+        unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_string) }
+            .map_err(|error| crate::PowerError::Parse(error.to_string()))?;
+        let value = unsafe { sid_string.to_string() }
+            .map_err(|error| crate::PowerError::Parse(error.to_string()));
+        unsafe {
+            let _ = LocalFree(Some(HLOCAL(sid_string.0.cast())));
+        }
+        value
+    })();
+
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    result
 }
 
 #[cfg(not(windows))]
@@ -261,10 +347,51 @@ mod tests {
     }
 
     #[test]
-    fn agent_pipe_security_allows_interactive_read_write() {
-        assert!(AGENT_PIPE_SDDL.contains(";;;SY"));
-        assert!(AGENT_PIPE_SDDL.contains(";;;BA"));
-        assert!(AGENT_PIPE_SDDL.contains("GRGW;;;IU"));
-        assert!(!AGENT_PIPE_SDDL.contains("GA;;;IU"));
+    fn agent_pipe_security_is_scoped_to_the_current_user() {
+        let descriptor = agent_pipe_security_descriptor().expect("security descriptor");
+        let current_sid = current_user_sid_string().expect("current user SID");
+
+        assert!(descriptor.contains(";;;SY"));
+        assert!(descriptor.contains(";;;BA"));
+        assert!(descriptor.contains(&format!("GRGW;;;{current_sid}")));
+        assert!(!descriptor.contains(";;;IU"));
+    }
+
+    #[test]
+    fn oversized_client_requests_are_rejected_before_calling_windows() {
+        let request = "x".repeat(PIPE_REQUEST_MAX_BYTES + 1);
+
+        let error = call_named_pipe(r"\\.\pipe\PowerShiftMissingTestPipe", &request)
+            .expect_err("oversized request should fail locally");
+
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pipe_roundtrip_succeeds_without_a_flush_barrier() {
+        let pipe_name = format!(
+            r"\\.\pipe\PowerShiftRoundtrip-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        );
+        let server_name = pipe_name.clone();
+        let (ready_sender, ready_receiver) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (_descriptor, attributes) = named_pipe_security_attributes().expect("security");
+            let handle = create_server_pipe(&server_name, &attributes).expect("create pipe");
+            ready_sender.send(()).expect("signal ready");
+            let result = serve_one_client(handle, &mut |request| format!("pong:{request}"));
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
+            result
+        });
+        ready_receiver.recv().expect("wait for server");
+
+        let response = call_named_pipe(&pipe_name, "ping").expect("client roundtrip");
+
+        assert_eq!(response, "pong:ping");
+        server.join().expect("server thread").expect("serve client");
     }
 }
