@@ -39,7 +39,7 @@ universal guarantees.
 ## Verification
 
 - Rust: 219 tests passed; 1 real power-plan mutation test intentionally ignored.
-- Frontend: 97 tests passed.
+- Frontend: 98 tests passed.
 - Formatting and Clippy with warnings denied: passed.
 - npm audit: 0 vulnerabilities.
 - RustSec audit: no unapproved advisory.

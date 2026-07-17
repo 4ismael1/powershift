@@ -47,6 +47,9 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all -- --check
 
+      - name: Prepare native bundle resources
+        run: npm run prepare:native
+
       - name: Lint Rust with warnings denied
         run: cargo clippy --workspace --all-targets -- -D warnings
 

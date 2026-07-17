@@ -80,4 +80,13 @@ describe('release supply-chain contract', () => {
     expect(versionVerifier).toContain('$env:GITHUB_REF_NAME');
     expect(releaseWorkflow).toContain("-Tag '${{ github.ref_name }}'");
   });
+
+  it('builds native bundle resources before linting the Tauri host', () => {
+    for (const workflow of [ciWorkflow, releaseWorkflow]) {
+      const prepare = workflow.indexOf('npm run prepare:native');
+      const clippy = workflow.indexOf('cargo clippy --workspace --all-targets');
+      expect(prepare).toBeGreaterThan(0);
+      expect(clippy).toBeGreaterThan(prepare);
+    }
+  });
 });

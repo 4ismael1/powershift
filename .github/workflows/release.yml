@@ -47,6 +47,7 @@ jobs:
         shell: pwsh
         run: |
           cargo fmt --all -- --check
+          npm run prepare:native
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
           npm test

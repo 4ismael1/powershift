@@ -199,7 +199,7 @@ Run checks:
 ```powershell
 npm.cmd test
 cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+npm.cmd run lint:rust
 npm audit --audit-level=high
 cargo audit -D warnings
 ```

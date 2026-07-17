@@ -17,6 +17,8 @@
     "build:agent:release": "cargo build -p powershift-agent --release",
     "build:tray:debug": "cargo build -p powershift-tray",
     "build:tray:release": "cargo build -p powershift-tray --release",
+    "prepare:native": "npm run build:agent:release && npm run build:tray:release",
+    "lint:rust": "npm run prepare:native && cargo clippy --workspace --all-targets -- -D warnings",
     "test": "vitest run",
     "preview": "vite preview",
     "tauri": "tauri",
