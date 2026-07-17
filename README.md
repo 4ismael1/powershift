@@ -224,16 +224,16 @@ target/release/bundle/nsis/PowerShift_1.0.0_x64-setup.exe
 
 ## Release Engineering
 
-Normal CI produces an explicitly unsigned installer for validation. The signed
-release workflow remains fail-closed: once certificate secrets are configured,
-it signs all three PowerShift executables plus the installer, verifies
-Authenticode, publishes a SHA-256 checksum, and records build provenance.
+PowerShift is distributed as an unsigned Windows application. Normal CI runs
+the complete test and dependency-audit suite, builds an unsigned NSIS installer,
+and retains it as a short-lived validation artifact. Stable installers are
+published manually through GitHub Releases together with a SHA-256 checksum.
+Windows SmartScreen may therefore display an unknown-publisher warning.
 
-`v1.0.0` establishes the stable code line. Its unsigned-distribution and
-environment-validation limitations are documented in the release notes and the
-[stable release checklist](docs/STABLE_RELEASE_CHECKLIST.md). Stable updates are
-distributed manually through GitHub Releases; an in-app updater is intentionally
-deferred until its separate signing key and rollback process are ready.
+`v1.0.0` establishes the stable code line. Its distribution and environment
+validation limitations are documented in the release notes and the
+[stable release checklist](docs/STABLE_RELEASE_CHECKLIST.md). An in-app updater
+is intentionally deferred until a secure update and rollback design is ready.
 
 For support reports, use the privacy-bounded collector documented in
 [docs/SUPPORT.md](docs/SUPPORT.md). It excludes user configuration, IPC control
@@ -256,7 +256,6 @@ Publish installable builds through GitHub Releases instead.
 
 ## Roadmap
 
-- Code signing for trusted publisher and SmartScreen reputation.
 - Broader game, launcher, protected-process, and multi-session compatibility
   testing.
 - More diagnostics around active profile matching and degraded recovery.

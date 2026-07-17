@@ -57,8 +57,8 @@ Existing valid preview configuration is preserved during upgrade.
 
 ## Known limitations
 
-- This initial stable installer is not code-signed. Windows SmartScreen may
-  display a warning; verify the SHA-256 above before running it.
+- PowerShift is distributed unsigned. Windows SmartScreen may display an
+  unknown-publisher warning; verify the SHA-256 above before running it.
 - Installing from a standard account by supplying credentials for a different
   administrator account is not a supported scenario.
 - Broader clean-VM, protected-game, launcher, and multi-session validation

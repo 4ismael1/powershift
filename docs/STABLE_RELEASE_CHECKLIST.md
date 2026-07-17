@@ -26,24 +26,20 @@ follow-up explicitly instead of presenting the gate as completed.
 - [ ] CI uses the repository-pinned Node and Rust toolchains.
 - [ ] The Windows CI workflow builds the NSIS installer from a clean checkout.
 
-## 3. Signed Distribution
+## 3. Unsigned Distribution Integrity
 
-- [ ] A Windows code-signing certificate and private key are stored outside the
-      repository and backed up securely.
-- [ ] GitHub release secrets are configured: `WINDOWS_CERTIFICATE_BASE64`,
-      `WINDOWS_CERTIFICATE_PASSWORD`, and `WINDOWS_TIMESTAMP_URL`.
-- [ ] Authenticode is valid and timestamped for `powershift.exe`,
-      `powershift-agent.exe`, `powershift-tray.exe`, and the NSIS installer.
-- [ ] The release includes a SHA-256 checksum and GitHub build-provenance
-      attestation.
-- [ ] Windows UAC displays the expected verified publisher, product name, and
-      PowerShift icon.
-- [ ] No certificate, private key, token, log, local config, or generated binary
+- [ ] The release is explicitly identified as unsigned; no verified-publisher
+      claim appears in documentation or release metadata.
+- [ ] The release includes a SHA-256 checksum for the exact installer asset.
+- [ ] A fresh download from GitHub matches the published SHA-256 checksum.
+- [ ] Windows UAC displays the expected product name and PowerShift icon; an
+      unknown-publisher warning is expected.
+- [ ] No token, log, local config, generated binary, certificate, or private key
       is tracked by Git.
 
-PowerShift 1.0 may use signed manual updates through GitHub Releases. An in-app
-updater is deferred until its independent signing key has been generated,
-backed up, and a rollback strategy has been tested.
+PowerShift releases are published manually through GitHub Releases. An in-app
+updater is deferred until a secure update-verification and rollback strategy has
+been designed and tested.
 
 ## 4. Clean Installation Matrix
 
@@ -170,10 +166,8 @@ follow-up version.
 ### v1.0.0 accepted exceptions
 
 - Owner: `4ismael1`.
-- The first stable installer is unsigned because no Windows code-signing
-  certificate is configured. SmartScreen may warn; the release publishes a
-  SHA-256 checksum. Follow-up: sign a `1.0.x` release once certificate material
-  is available.
+- PowerShift is intentionally distributed unsigned. SmartScreen may warn; every
+  release must publish and verify a SHA-256 checksum for the installer.
 - Automated tests, local install/reboot, Chrome activation/restore, IPC, WMI,
   task elevation, ACL, uninstall, and resource checks were exercised on the
   development system. The complete clean-VM and protected-game matrix remains
