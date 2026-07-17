@@ -15,6 +15,10 @@ const rustToolchain = readFileSync(
   fileURLToPath(new URL('../rust-toolchain.toml', import.meta.url)),
   'utf8',
 );
+const versionVerifier = readFileSync(
+  fileURLToPath(new URL('../scripts/verify-version.ps1', import.meta.url)),
+  'utf8',
+);
 
 describe('release supply-chain contract', () => {
   it('pins every GitHub Action to an immutable commit', () => {
@@ -69,5 +73,11 @@ describe('release supply-chain contract', () => {
     expect(ciWorkflow).toContain('rustup toolchain install 1.97.1');
     expect(releaseWorkflow).toContain('rustup toolchain install 1.97.1');
     expect(`${ciWorkflow}\n${releaseWorkflow}`).not.toContain('rustup update stable');
+  });
+
+  it('validates a GitHub ref as a version only when the ref is a tag', () => {
+    expect(versionVerifier).toContain("$env:GITHUB_REF_TYPE -eq 'tag'");
+    expect(versionVerifier).toContain('$env:GITHUB_REF_NAME');
+    expect(releaseWorkflow).toContain("-Tag '${{ github.ref_name }}'");
   });
 });

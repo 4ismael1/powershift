@@ -1,9 +1,13 @@
 param(
-  [string]$Tag = $env:GITHUB_REF_NAME
+  [string]$Tag
 )
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
+
+if (-not $PSBoundParameters.ContainsKey('Tag') -and $env:GITHUB_REF_TYPE -eq 'tag') {
+  $Tag = $env:GITHUB_REF_NAME
+}
 
 $packageJson = Get-Content -LiteralPath (Join-Path $root 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $tauriConfig = Get-Content -LiteralPath (Join-Path $root 'src-tauri\tauri.conf.json') -Raw -Encoding UTF8 | ConvertFrom-Json
