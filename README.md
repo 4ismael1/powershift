@@ -79,6 +79,11 @@ backup. Both file size and collection counts are bounded before the elevated
 agent accepts the configuration. The agent can read the backup without ever
 rewriting user-owned `%APPDATA%` data.
 
+WMI start and stop subscriptions are supervised independently with bounded
+backoff. Process tracking is restricted to the current interactive Windows
+session, and scheduler deadlines remain absolute even during heavy process
+event traffic, so restores and recovery scans cannot be starved.
+
 ## Resource Usage
 
 PowerShift is designed around a simple rule: the background path must stay tiny,
@@ -89,36 +94,40 @@ In normal use, the resident background footprint is only the Rust agent plus the
 tray helper. The Tauri/WebView UI is temporary; closing the window removes the
 interface from the steady-state workload.
 
-Preview measurement for `v0.2.0-preview.1` on a Windows desktop during a
-representative five-minute desktop session with the UI closed:
+Measurement from the `v1.0.0` stabilization build on a Windows desktop during
+a representative five-minute session with the UI closed, one Chrome profile
+active, and 18 Chrome process instances tracked:
 
 | Mode | CPU sample | Working set | Private memory |
 | --- | --- | --- | --- |
-| Background combined | ~0.078 s over 5 min | ~13.83 MB average | ~4.81 MB average |
-| Agent only | ~0.078 s over 5 min | ~4.92 MB average, 7.05 MB max | ~2.94 MB average |
-| Tray only | 0 measured over 5 min | ~8.91 MB average, 8.93 MB max | ~1.87 MB average |
-| UI tree only | 0 measured over 1 min | ~346.02 MB average | ~154.88 MB average |
+| Background combined | 0.015625 s over 5 min | ~16.64 MiB average | ~5.18 MiB average |
+| Agent only | 0.015625 s over 5 min | ~7.56 MiB average, 10.97 MiB max | ~3.11 MiB average |
+| Tray only | 0 measured over 5 min | ~9.08 MiB average, 9.10 MiB max | ~2.06 MiB average |
+| UI tree only | 0 measured over 1 min | ~346.02 MiB average | ~154.88 MiB average |
 
 ```mermaid
 xychart-beta
-  title "Resident memory, UI closed (5 min preview sample)"
+  title "Resident memory, UI closed (5 min sample)"
   x-axis ["Agent", "Tray", "Combined"]
   y-axis "Working set (MB)" 0 --> 16
-  bar [4.92, 8.91, 13.83]
+  bar [7.56, 9.08, 16.64]
 ```
 
 The UI figure includes `powershift.exe` plus six Microsoft Edge WebView2
 processes. Working set counts shared Chromium pages and is therefore much larger
 than private memory. Closing PowerShift terminated the host and all six WebView2
 children immediately; only the two small Rust background processes remained.
-During the five-minute background sample, `agent-state.json` was not rewritten.
+All 300 one-second samples were valid. The agent used 0.0052% of one logical
+processor on average, its handle count stayed between 210 and 221 while
+tracking the Chrome instances, and `agent-state.json` did not change in hash,
+size, or modification time.
 
 The important behavior is not that the configuration UI uses no memory. It is
 that the UI is not the automation engine. Most of the time PowerShift should be
 closed to the tray, leaving the low-resource Rust background components active.
-These numbers describe the current preview build on one machine, not a universal
-benchmark or final ceiling. Continued optimization of the agent, tray, and
-process tracking model remains part of the project roadmap.
+These numbers describe the current stable code line on one machine, not a
+universal benchmark or final ceiling. Continued optimization of the agent, tray,
+and process tracking model remains part of the project roadmap.
 
 ## Detection Model
 
@@ -150,18 +159,25 @@ native exit waits keep tracking already-known processes.
 
 ## Installation
 
-Download the latest preview installer from GitHub Releases. Current tag: `v0.2.0-preview.1`.
+Download the latest stable installer from GitHub Releases. Current tag: `v1.0.0`.
+
+PowerShift currently targets Windows 10/11 x64 and an administrator Windows
+account. The elevated agent is installed as a SID-scoped scheduled task for the
+account running the installer. Installing from a standard account by entering
+different administrator credentials is not a supported 1.0 scenario; sign in
+to the intended administrator account before installing.
 
 Recommended release asset:
 
 ```text
-PowerShift_0.2.0-preview.1_x64-setup.exe
+PowerShift_1.0.0_x64-setup.exe
 ```
 
 The installer contains the UI, agent, tray, and scheduled task setup.
 
-> Note: preview builds are not digitally signed yet. Windows SmartScreen may
-> show a warning until signed releases are available.
+> Note: the initial `v1.0.0` installer is not digitally signed. Windows
+> SmartScreen may show a warning. Verify the SHA-256 published with the release
+> before running it.
 
 ## Development
 
@@ -184,6 +200,8 @@ Run checks:
 npm.cmd test
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+npm audit --audit-level=high
+cargo audit -D warnings
 ```
 
 Build frontend, agent, and tray:
@@ -201,8 +219,25 @@ npm.cmd run tauri -- build
 Generated installer:
 
 ```text
-target/release/bundle/nsis/PowerShift_0.2.0_x64-setup.exe
+target/release/bundle/nsis/PowerShift_1.0.0_x64-setup.exe
 ```
+
+## Release Engineering
+
+Normal CI produces an explicitly unsigned installer for validation. The signed
+release workflow remains fail-closed: once certificate secrets are configured,
+it signs all three PowerShift executables plus the installer, verifies
+Authenticode, publishes a SHA-256 checksum, and records build provenance.
+
+`v1.0.0` establishes the stable code line. Its unsigned-distribution and
+environment-validation limitations are documented in the release notes and the
+[stable release checklist](docs/STABLE_RELEASE_CHECKLIST.md). Stable updates are
+distributed manually through GitHub Releases; an in-app updater is intentionally
+deferred until its separate signing key and rollback process are ready.
+
+For support reports, use the privacy-bounded collector documented in
+[docs/SUPPORT.md](docs/SUPPORT.md). It excludes user configuration, IPC control
+tokens, and the crash-recovery power lease.
 
 ## Repository Policy
 
@@ -225,7 +260,7 @@ Publish installable builds through GitHub Releases instead.
 - Broader game, launcher, protected-process, and multi-session compatibility
   testing.
 - More diagnostics around active profile matching and degraded recovery.
-- UI polish and accessibility pass.
+- Additional localization and accessibility validation across Windows display scales.
 
 ## License
 

@@ -5,6 +5,7 @@ export interface EventLogEntry {
   level: string;
   kind: string;
   message: string;
+  profile_id?: string | null;
   profile_name?: string | null;
   plan_id?: string | null;
 }

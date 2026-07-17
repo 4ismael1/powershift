@@ -1,10 +1,25 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { clearIconCache, getExecutableIcon, loadProfileIcons } from './iconApi';
+import {
+  candidateIconMapKey,
+  clearIconCache,
+  getExecutableIcon,
+  loadProfileIcons,
+  processIconMapKey,
+} from './iconApi';
 import type { InvokeFn } from './powerApi';
 
 describe('iconApi', () => {
   beforeEach(() => {
     clearIconCache();
+  });
+
+  it('uses stable keys for process and candidate icon maps', () => {
+    expect(processIconMapKey({ pid: 42, name: 'GAME.EXE', path: 'C:/Games/Game.exe' })).toBe(
+      'process:42:c:\\games\\game.exe',
+    );
+    expect(candidateIconMapKey({ executablePath: 'C:/Games/Game.exe' })).toBe(
+      'candidate:c:\\games\\game.exe',
+    );
   });
 
   it('calls Tauri command with the executable path', async () => {
@@ -59,5 +74,18 @@ describe('iconApi', () => {
       second: 'data:image/png;base64,OK',
     });
     expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds the icon cache and evicts the least recently used path', async () => {
+    const invoke = vi.fn().mockResolvedValue('data:image/png;base64,ICON') as unknown as InvokeFn;
+    const profiles = Array.from({ length: 129 }, (_, index) => ({
+      id: `profile-${index}`,
+      path: `C:\\Games\\Game-${index}.exe`,
+    }));
+
+    await loadProfileIcons(invoke, profiles);
+    await loadProfileIcons(invoke, [profiles[0]]);
+
+    expect(invoke).toHaveBeenCalledTimes(130);
   });
 });

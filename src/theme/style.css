@@ -58,6 +58,13 @@ button:disabled {
   cursor: default;
 }
 
+button:focus-visible,
+input:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--accent-ring);
+  outline-offset: 2px;
+}
+
 .app-frame {
   position: relative;
   width: 100vw;
@@ -329,6 +336,7 @@ button:disabled {
   min-width: 160px;
 }
 
+.primary-action.compact,
 .secondary-action.compact {
   min-width: 112px;
   height: 34px;
@@ -407,19 +415,42 @@ button:disabled {
   line-height: 1.4;
 }
 
+.empty-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+
 .game-row {
   position: relative;
   width: 100%;
   min-height: 74px;
   display: grid;
-  grid-template-columns: 8px 58px minmax(0, 1fr) max-content 32px;
+  grid-template-columns: minmax(0, 1fr) 32px;
   align-items: center;
-  gap: 10px;
-  padding: 8px 10px 8px 4px;
+  gap: 4px;
+  padding: 4px;
   border: 1px solid transparent;
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--text-main);
+  text-align: left;
+}
+
+.game-select {
+  min-width: 0;
+  min-height: 64px;
+  display: grid;
+  grid-template-columns: 8px 58px minmax(0, 1fr) max-content;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px 4px 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: inherit;
   text-align: left;
   cursor: pointer;
 }
@@ -428,7 +459,8 @@ button:disabled {
   background: rgba(255, 255, 255, 0.035);
 }
 
-.game-row:focus-visible {
+.game-select:focus-visible,
+.row-action:focus-visible {
   outline: 2px solid var(--accent-ring);
   outline-offset: 2px;
 }
@@ -693,6 +725,8 @@ button:disabled {
 }
 
 .process-column {
+  grid-template-rows: 26px minmax(0, 1fr) 34px 34px;
+  align-content: stretch;
   border-left: 1px solid var(--stroke-soft);
 }
 
@@ -734,8 +768,9 @@ button:disabled {
 }
 
 .process-list {
+  min-height: 0;
   display: grid;
-  max-height: 104px;
+  align-content: start;
   overflow-y: auto;
   border: 1px solid var(--stroke-soft);
   border-radius: var(--radius-sm);
@@ -780,6 +815,16 @@ button:disabled {
 
 .process-row:disabled svg:last-child {
   color: var(--text-muted);
+}
+
+.primary-process-row {
+  cursor: default;
+}
+
+.process-row .process-role {
+  flex: 0 0 auto;
+  color: var(--text-muted);
+  font-size: 11px;
 }
 
 .add-process {
@@ -874,6 +919,80 @@ button:disabled {
   box-shadow: none;
 }
 
+.drawer-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 18;
+  background: rgba(0, 0, 0, 0.36);
+}
+
+.confirm-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgba(0, 0, 0, 0.62);
+}
+
+.confirm-dialog {
+  width: min(390px, 100%);
+  display: grid;
+  gap: 16px;
+  padding: 16px;
+  border: 1px solid var(--stroke-mid);
+  border-radius: var(--radius-md);
+  background: #111716;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.58);
+}
+
+.confirm-dialog:focus {
+  outline: none;
+}
+
+.confirm-header,
+.confirm-actions {
+  display: flex;
+  align-items: center;
+}
+
+.confirm-header {
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.confirm-header strong {
+  font-size: 17px;
+}
+
+.confirm-dialog p {
+  margin: 0;
+  color: var(--text-soft);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.confirm-actions {
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.danger-action {
+  min-width: 132px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 101, 101, 0.42);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 101, 101, 0.12);
+  color: #ffb1b1;
+  cursor: pointer;
+}
+
 .process-drawer {
   position: absolute;
   top: 122px;
@@ -923,6 +1042,12 @@ button:disabled {
   border-radius: var(--radius-md);
   background: #101515;
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.process-drawer:focus,
+.settings-drawer:focus,
+.events-drawer:focus {
+  outline: none;
 }
 
 .toast {
@@ -1221,12 +1346,6 @@ button:disabled {
   font-size: 12px;
 }
 
-.github-mark {
-  width: 16px;
-  height: 16px;
-  flex: 0 0 auto;
-}
-
 .live-dot {
   width: 10px;
   height: 10px;
@@ -1260,7 +1379,11 @@ button:disabled {
   }
 
   .game-row {
-    grid-template-columns: 8px 52px minmax(0, 1fr) max-content 30px;
+    grid-template-columns: minmax(0, 1fr) 30px;
+  }
+
+  .game-select {
+    grid-template-columns: 8px 52px minmax(0, 1fr) max-content;
     gap: 8px;
   }
 

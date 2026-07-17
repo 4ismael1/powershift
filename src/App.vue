@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
@@ -11,7 +11,6 @@ import {
   Folder,
   Gauge,
   List,
-  Menu,
   Minus,
   Play,
   Plus,
@@ -19,7 +18,6 @@ import {
   Settings,
   SlidersHorizontal,
   Sparkles,
-  RefreshCw,
   Trash2,
   X,
   Zap,
@@ -34,15 +32,17 @@ import {
   removeAssociatedProcessFromProfile,
   removeProfileFromConfig,
   saveAppConfig,
+  takeConfigRecoveryWarning,
   updateAppSettingsConfig,
   updateProfileConfig,
   type AppSettingsUpdate,
   type AppConfig,
+  type ConfigSaveOutcome,
   type ProfileUpdate,
   type UiGameProfile,
 } from '@/services/configApi';
 import { detectProfileCandidates, type ProfileCandidate } from '@/services/autoDetect';
-import { clearEvents, formatEventTime, getRecentEvents, type EventLogEntry } from '@/services/eventsApi';
+import { clearEvents, getRecentEvents, type EventLogEntry } from '@/services/eventsApi';
 import {
   agentTaskInstalled,
   agentStateSignature,
@@ -51,7 +51,6 @@ import {
   describeAgentState,
   getAgentState,
   installAgentTask,
-  shouldAutoInstallElevatedAgent,
   startAgentTask,
   wakeAgent,
   type AgentStateTone,
@@ -59,8 +58,13 @@ import {
 } from '@/services/agentApi';
 import { pickExecutable } from '@/services/executableDialog';
 import { gameSortModeLabel, nextGameSortMode, sortGames, type GameSortMode } from '@/services/gameList';
-import { loadProfileIcons, type IconMap } from '@/services/iconApi';
-import { filterProcesses, getOpenProcesses, type ProcessInfo } from '@/services/processApi';
+import {
+  candidateIconMapKey,
+  loadProfileIcons,
+  processIconMapKey,
+  type IconMap,
+} from '@/services/iconApi';
+import { getOpenProcesses, type ProcessInfo } from '@/services/processApi';
 import {
   getActivePowerPlan,
   getPowerPlans,
@@ -71,11 +75,20 @@ import {
   type PowerPlan,
 } from '@/services/powerApi';
 import { openExecutableFolder, openExternalUrl } from '@/services/shellApi';
+import ConfirmDialog from '@/components/ConfirmDialog.vue';
+import EventsDrawer from '@/components/EventsDrawer.vue';
+import ProcessDrawer, { type ProcessDrawerMode } from '@/components/ProcessDrawer.vue';
+import SettingsDrawer from '@/components/SettingsDrawer.vue';
 
 type PowerLevel = 'max' | 'high' | 'balanced';
 type GameStatus = 'active' | 'inactive' | 'disabled';
 type GameProfile = UiGameProfile;
-type ProcessDrawerMode = 'processes' | 'candidates' | 'associate';
+type ConfirmationRequest = {
+  title: string;
+  message: string;
+  confirmLabel: string;
+  action: () => Promise<void>;
+};
 
 const GITHUB_PROFILE_URL = 'https://github.com/4ismael1';
 
@@ -96,7 +109,6 @@ const processDrawerMode = ref<ProcessDrawerMode>('processes');
 const openProcesses = ref<ProcessInfo[]>([]);
 const detectedCandidates = ref<ProfileCandidate[]>([]);
 const recentEvents = ref<EventLogEntry[]>([]);
-const processQuery = ref('');
 const agentStatusText = ref('Escuchando eventos de procesos');
 const agentStatusTone = ref<AgentStateTone>('idle');
 const powerLoading = ref(false);
@@ -108,6 +120,7 @@ const processIcons = ref<IconMap>({});
 const agentTaskReady = ref(false);
 const appReady = ref(false);
 const notice = ref<{ kind: 'success' | 'info' | 'error'; message: string } | null>(null);
+const confirmation = ref<ConfirmationRequest | null>(null);
 let noticeTimer: number | undefined;
 let agentSnapshotTimer: number | undefined;
 let unlistenAgentState: UnlistenFn | undefined;
@@ -116,6 +129,7 @@ let lastAgentStateSignature: string | undefined;
 let lastPublishedAgentState: PublishedAgentState | null = null;
 let agentSnapshotInFlight = false;
 let agentSnapshotPending = false;
+let drawerTrigger: HTMLElement | null = null;
 
 const tauriInvoke: InvokeFn = (command, args) => invoke(command, args);
 
@@ -129,23 +143,14 @@ const filteredGames = computed(() => {
 });
 const activeGame = computed(() => games.value.find((game) => game.status === 'active'));
 const globalNotificationsEnabled = computed(() => currentConfig.value?.automation.notifications_enabled ?? true);
-const filteredOpenProcesses = computed(() => filterProcesses(openProcesses.value, processQuery.value));
-const filteredCandidates = computed(() => {
-  const value = processQuery.value.trim().toLowerCase();
-  if (!value) return detectedCandidates.value;
-  return detectedCandidates.value.filter((candidate) =>
-    `${candidate.name} ${candidate.executableName} ${candidate.executablePath} ${candidate.pid}`
-      .toLowerCase()
-      .includes(value),
-  );
+const closeDelayOptions = computed(() => {
+  const delays = new Set([0, 5, 10, 15, 30, 45, 60, 120]);
+  const configured = Number.parseInt(selectedGame.value?.closeDelay ?? '', 10);
+  if (Number.isFinite(configured) && configured >= 0) delays.add(configured);
+  return [...delays].sort((left, right) => left - right).map((seconds) => `${seconds} s`);
 });
-const drawerTitle = computed(() => {
-  if (processDrawerMode.value === 'candidates') return 'Auto detectar';
-  if (processDrawerMode.value === 'associate') return 'Asociar proceso';
-  return 'Procesos abiertos';
-});
-const drawerCount = computed(() =>
-  processDrawerMode.value === 'candidates' ? detectedCandidates.value.length : openProcesses.value.length,
+const drawerOpen = computed(
+  () => processPanelOpen.value || settingsPanelOpen.value || eventsPanelOpen.value,
 );
 const powerPlanOptions = computed(() => toPowerPlanOptions(powerPlans.value));
 const controllingGame = computed(
@@ -178,14 +183,6 @@ function statusLabel(status: GameStatus) {
   return 'Inactivo';
 }
 
-function eventKindLabel(kind: string) {
-  if (kind === 'profile_activated') return 'Perfil activado';
-  if (kind === 'power_plan_restored') return 'Plan restaurado';
-  if (kind === 'restore_scheduled') return 'Restauracion programada';
-  if (kind === 'agent_error') return 'Error del agente';
-  return kind.split('_').join(' ');
-}
-
 async function updateSelectedGame(field: 'startPlan' | 'closePlan' | 'closeDelay', value: string) {
   const game = selectedGame.value;
   if (game) {
@@ -215,17 +212,34 @@ async function refreshPowerState() {
 async function refreshConfig() {
   try {
     const loadedConfig = await getAppConfig(tauriInvoke);
-    const config = normalizeProfilePriorities(loadedConfig, powerPlans.value);
-    if (JSON.stringify(config.profiles) !== JSON.stringify(loadedConfig.profiles)) {
-      await saveAppConfig(tauriInvoke, config);
-    }
+    const recoveryWarning = await takeConfigRecoveryWarning(tauriInvoke);
+    const config = loadedConfig;
     currentConfig.value = config;
     automatic.value = config.automation.enabled;
     applyConfigProfiles(config);
     selectedId.value = games.value[0]?.id ?? '';
     syncProfilePlanSelections(powerPlans.value);
+    if (recoveryWarning) showNotice('info', recoveryWarning);
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
+  }
+}
+
+async function persistConfig(config: AppConfig): Promise<ConfigSaveOutcome> {
+  return saveAppConfig(tauriInvoke, config);
+}
+
+function showSaveWarnings(outcome: ConfigSaveOutcome) {
+  if (outcome.warnings.length > 0) {
+    showNotice('info', `Cambios guardados. ${outcome.warnings.join(' ')}`);
+  }
+}
+
+function showSaveOutcome(message: string, outcome: ConfigSaveOutcome) {
+  if (outcome.warnings.length > 0) {
+    showNotice('info', `${message} ${outcome.warnings.join(' ')}`);
+  } else {
+    showNotice('success', message);
   }
 }
 
@@ -238,8 +252,17 @@ async function refreshRecentEvents() {
 }
 
 async function clearEventHistory() {
-  if (!window.confirm('Borrar el historial de eventos de PowerShift?')) return;
+  eventsPanelOpen.value = false;
+  await nextTick();
+  confirmation.value = {
+    title: 'Borrar historial',
+    message: 'Se eliminaran los eventos de diagnostico guardados en este equipo.',
+    confirmLabel: 'Borrar historial',
+    action: performClearEventHistory,
+  };
+}
 
+async function performClearEventHistory() {
   powerError.value = '';
   powerLoading.value = true;
   try {
@@ -271,13 +294,13 @@ async function addExecutableProfile() {
   try {
     const config = currentConfig.value ?? (await getAppConfig(tauriInvoke));
     const nextConfig = addProfileToConfig(config, executablePath, powerPlans.value);
-    await saveAppConfig(tauriInvoke, nextConfig);
+    const outcome = await persistConfig(nextConfig);
     await refreshRecentEvents();
     currentConfig.value = nextConfig;
     applyConfigProfiles(nextConfig);
     selectedId.value = nextConfig.profiles[nextConfig.profiles.length - 1]?.id ?? '';
     syncProfilePlanSelections(powerPlans.value);
-    showNotice('success', 'Perfil agregado y listo para detectar.');
+    showSaveOutcome('Perfil agregado y listo para detectar.', outcome);
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -294,18 +317,22 @@ async function refreshActivePowerPlanSilently() {
   }
 }
 
-async function persistAppSettings(update: AppSettingsUpdate) {
+async function persistAppSettings(update: AppSettingsUpdate): Promise<ConfigSaveOutcome | null> {
   powerError.value = '';
   powerLoading.value = true;
   try {
     const config = currentConfig.value ?? (await getAppConfig(tauriInvoke));
     const nextConfig = updateAppSettingsConfig(config, update);
-    await saveAppConfig(tauriInvoke, nextConfig);
+    const outcome = await persistConfig(nextConfig);
     await refreshRecentEvents();
     currentConfig.value = nextConfig;
     automatic.value = nextConfig.automation.enabled;
+    showSaveWarnings(outcome);
+    return outcome;
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
+    showNotice('error', powerError.value);
+    return null;
   } finally {
     powerLoading.value = false;
   }
@@ -313,9 +340,12 @@ async function persistAppSettings(update: AppSettingsUpdate) {
 
 async function toggleAutomatic() {
   const enabled = !automatic.value;
-  await persistAppSettings({ automationEnabled: enabled });
+  const outcome = await persistAppSettings({ automationEnabled: enabled });
+  if (!outcome) return;
   agentStatusText.value = enabled ? 'Agente activo' : 'Automatización pausada';
-  showNotice('info', enabled ? 'Automatización activada.' : 'Automatización pausada.');
+  if (outcome.warnings.length === 0) {
+    showNotice('info', enabled ? 'Automatización activada.' : 'Automatización pausada.');
+  }
 }
 
 async function openGithubProfile() {
@@ -339,41 +369,22 @@ async function refreshAgentTaskInstalled() {
   }
 }
 
-async function installElevatedAgent(options: { automatic?: boolean } = {}) {
-  const automaticInstall = options.automatic ?? false;
+async function installElevatedAgent() {
   powerError.value = '';
-  if (automaticInstall) {
-    agentSetupLoading.value = true;
-    agentStatusText.value = 'Preparando agente elevado';
-    agentStatusTone.value = 'warning';
-    showNotice('info', 'Windows pedirá permiso para instalar el agente elevado.');
-  } else {
-    powerLoading.value = true;
-    showNotice('info', 'Windows pedira permiso para reparar el agente elevado.');
-  }
+  powerLoading.value = true;
+  agentSetupLoading.value = true;
+  showNotice('info', 'Windows pedira permiso para reparar PowerShift.');
   try {
     await installAgentTask(tauriInvoke);
     agentTaskReady.value = true;
     await refreshAgentSnapshot({ forceLinkedRefresh: true });
-    showNotice('success', automaticInstall ? 'Agente elevado preparado.' : 'Agente elevado instalado e iniciado.');
+    showNotice('success', 'Agente elevado reparado e iniciado.');
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
-    agentStatusText.value = automaticInstall ? 'Instalación del agente pendiente' : agentStatusText.value;
-    agentStatusTone.value = automaticInstall ? 'warning' : agentStatusTone.value;
-    if (automaticInstall) {
-      settingsPanelOpen.value = true;
-      processPanelOpen.value = false;
-      eventsPanelOpen.value = false;
-      showNotice('error', 'No se pudo instalar automáticamente. Reintenta desde Configuración.');
-    } else {
-      showNotice('error', powerError.value);
-    }
+    showNotice('error', powerError.value);
   } finally {
-    if (automaticInstall) {
-      agentSetupLoading.value = false;
-    } else {
-      powerLoading.value = false;
-    }
+    agentSetupLoading.value = false;
+    powerLoading.value = false;
   }
 }
 
@@ -416,7 +427,6 @@ async function openProcessPanel() {
   settingsPanelOpen.value = false;
   eventsPanelOpen.value = false;
   processDrawerMode.value = 'processes';
-  processQuery.value = '';
   await refreshOpenProcesses();
 }
 
@@ -430,7 +440,6 @@ async function openAssociateProcessPanel() {
   settingsPanelOpen.value = false;
   eventsPanelOpen.value = false;
   processDrawerMode.value = 'associate';
-  processQuery.value = '';
   await refreshOpenProcesses();
 }
 
@@ -440,7 +449,6 @@ async function autoDetectProfiles() {
   processPanelOpen.value = true;
   settingsPanelOpen.value = false;
   eventsPanelOpen.value = false;
-  processQuery.value = '';
   detectedCandidates.value = [];
   processIcons.value = {};
   drawerLoading.value = true;
@@ -463,7 +471,7 @@ async function addDetectedCandidate(candidate: ProfileCandidate) {
   try {
     const config = currentConfig.value ?? (await getAppConfig(tauriInvoke));
     const nextConfig = addProfileToConfig(config, candidate.executablePath, powerPlans.value);
-    await saveAppConfig(tauriInvoke, nextConfig);
+    const outcome = await persistConfig(nextConfig);
     await refreshRecentEvents();
     currentConfig.value = nextConfig;
     applyConfigProfiles(nextConfig);
@@ -471,7 +479,7 @@ async function addDetectedCandidate(candidate: ProfileCandidate) {
     detectedCandidates.value = detectProfileCandidates(nextConfig, openProcesses.value);
     await refreshProcessIcons();
     syncProfilePlanSelections(powerPlans.value);
-    showNotice('success', 'Candidato agregado como perfil.');
+    showSaveOutcome('Candidato agregado como perfil.', outcome);
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -491,13 +499,13 @@ async function associateOpenProcess(process: ProcessInfo) {
       name: process.name,
       path: process.path ?? null,
     });
-    await saveAppConfig(tauriInvoke, nextConfig);
+    const outcome = await persistConfig(nextConfig);
     await refreshRecentEvents();
     currentConfig.value = nextConfig;
     applyConfigProfiles(nextConfig);
     selectedId.value = profileId;
     syncProfilePlanSelections(powerPlans.value);
-    showNotice('success', 'Proceso asociado al perfil.');
+    showSaveOutcome('Proceso asociado al perfil.', outcome);
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -515,13 +523,13 @@ async function persistSelectedProfile(update: ProfileUpdate) {
   try {
     const config = currentConfig.value ?? (await getAppConfig(tauriInvoke));
     const nextConfig = updateProfileConfig(config, profileId, update, powerPlans.value);
-    await saveAppConfig(tauriInvoke, nextConfig);
+    const outcome = await persistConfig(nextConfig);
     await refreshRecentEvents();
     currentConfig.value = nextConfig;
     applyConfigProfiles(nextConfig);
     selectedId.value = profileId;
     syncProfilePlanSelections(powerPlans.value);
-    showNotice('success', 'Perfil actualizado.');
+    showSaveOutcome('Perfil actualizado.', outcome);
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -532,20 +540,28 @@ async function persistSelectedProfile(update: ProfileUpdate) {
 async function deleteProfile(profileId: string) {
   const profile = games.value.find((game) => game.id === profileId);
   if (!profile) return;
-  if (!window.confirm(`Eliminar "${profile.name}" de PowerShift?`)) return;
 
+  confirmation.value = {
+    title: 'Eliminar perfil',
+    message: `Se eliminara "${profile.name}" y sus procesos asociados.`,
+    confirmLabel: 'Eliminar perfil',
+    action: () => performDeleteProfile(profileId),
+  };
+}
+
+async function performDeleteProfile(profileId: string) {
   powerError.value = '';
   powerLoading.value = true;
   try {
     const config = currentConfig.value ?? (await getAppConfig(tauriInvoke));
     const nextConfig = removeProfileFromConfig(config, profileId);
-    await saveAppConfig(tauriInvoke, nextConfig);
+    const outcome = await persistConfig(nextConfig);
     await refreshRecentEvents();
     currentConfig.value = nextConfig;
     applyConfigProfiles(nextConfig);
     selectedId.value = games.value[0]?.id ?? '';
     syncProfilePlanSelections(powerPlans.value);
-    showNotice('success', 'Perfil eliminado.');
+    showSaveOutcome('Perfil eliminado.', outcome);
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -563,13 +579,13 @@ async function removeAssociatedProcess(processName: string) {
   try {
     const config = currentConfig.value ?? (await getAppConfig(tauriInvoke));
     const nextConfig = removeAssociatedProcessFromProfile(config, profileId, processName);
-    await saveAppConfig(tauriInvoke, nextConfig);
+    const outcome = await persistConfig(nextConfig);
     await refreshRecentEvents();
     currentConfig.value = nextConfig;
     applyConfigProfiles(nextConfig);
     selectedId.value = profileId;
     syncProfilePlanSelections(powerPlans.value);
-    showNotice('success', 'Proceso quitado.');
+    showSaveOutcome('Proceso quitado.', outcome);
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
   } finally {
@@ -629,24 +645,16 @@ async function refreshDrawer() {
   }
 }
 
-function processIconKey(process: ProcessInfo) {
-  return `${process.pid}-${process.path ?? process.name}`;
-}
-
-function candidateIconKey(candidate: ProfileCandidate) {
-  return `candidate-${candidate.executablePath}`;
-}
-
 async function refreshProcessIcons() {
   const loadId = ++processIconLoadId;
   const processItems = (processDrawerMode.value === 'candidates' ? [] : openProcesses.value)
     .filter((process) => process.path)
     .slice(0, 80)
-    .map((process) => ({ id: processIconKey(process), path: process.path ?? '' }));
+    .map((process) => ({ id: processIconMapKey(process), path: process.path ?? '' }));
   const candidateItems =
     processDrawerMode.value === 'candidates'
       ? detectedCandidates.value.slice(0, 80).map((candidate) => ({
-          id: candidateIconKey(candidate),
+          id: candidateIconMapKey(candidate),
           path: candidate.executablePath,
         }))
       : [];
@@ -750,22 +758,12 @@ async function subscribeToAgentState() {
   }
 }
 
-async function bootstrapElevatedAgentIfNeeded() {
-  const config = currentConfig.value;
-  if (!config) return;
-  if (!shouldAutoInstallElevatedAgent(config.agent.enabled, agentTaskReady.value, '__TAURI_INTERNALS__' in window)) return;
-
-  await installElevatedAgent({ automatic: true });
-}
-
 async function runAgentScanNow() {
   powerError.value = '';
   powerLoading.value = true;
   try {
     await wakeAgent(tauriInvoke);
-    await new Promise((resolve) => window.setTimeout(resolve, 500));
-    await refreshAgentSnapshot({ forceLinkedRefresh: true });
-    showNotice('success', 'Agente despertado y perfiles revaluados.');
+    showNotice('success', 'Reevaluacion solicitada al agente.');
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
     showNotice('error', powerError.value);
@@ -781,6 +779,42 @@ function toggleSettingsPanel() {
     eventsPanelOpen.value = false;
   }
 }
+
+async function confirmPendingAction() {
+  const pending = confirmation.value;
+  if (!pending) return;
+  confirmation.value = null;
+  await pending.action();
+}
+
+function closeOpenPanel() {
+  if (settingsPanelOpen.value) settingsPanelOpen.value = false;
+  else if (eventsPanelOpen.value) eventsPanelOpen.value = false;
+  else if (processPanelOpen.value) processPanelOpen.value = false;
+}
+
+function handleGlobalKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape' && drawerOpen.value) {
+    event.preventDefault();
+    closeOpenPanel();
+  }
+}
+
+watch(
+  [processPanelOpen, settingsPanelOpen, eventsPanelOpen],
+  async (current, previous) => {
+    const isOpen = current.some(Boolean);
+    const wasOpen = previous.some(Boolean);
+    if (isOpen && !wasOpen) {
+      drawerTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    }
+    await nextTick();
+    if (!isOpen && wasOpen) {
+      drawerTrigger?.focus();
+      drawerTrigger = null;
+    }
+  },
+);
 
 function showNotice(kind: 'success' | 'info' | 'error', message: string) {
   notice.value = { kind, message };
@@ -802,13 +836,29 @@ async function initializeApp() {
 
 async function finishStartupRefresh() {
   await Promise.allSettled([refreshPowerState(), refreshRecentEvents(), refreshAgentTaskInstalled()]);
+  await synchronizeCurrentProfilePriorities();
   await refreshAgentSnapshot();
-  window.setTimeout(() => {
-    void bootstrapElevatedAgentIfNeeded();
-  }, 900);
+}
+
+async function synchronizeCurrentProfilePriorities() {
+  const config = currentConfig.value;
+  if (!config || powerPlans.value.length === 0) return;
+
+  const normalized = normalizeProfilePriorities(config, powerPlans.value);
+  if (JSON.stringify(normalized.profiles) === JSON.stringify(config.profiles)) return;
+
+  try {
+    const outcome = await persistConfig(normalized);
+    currentConfig.value = normalized;
+    applyConfigProfiles(normalized);
+    showSaveWarnings(outcome);
+  } catch (error) {
+    powerError.value = error instanceof Error ? error.message : String(error);
+  }
 }
 
 onMounted(() => {
+  window.addEventListener('keydown', handleGlobalKeydown);
   void getVersion()
     .then((version) => {
       appVersion.value = version;
@@ -822,6 +872,7 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  window.removeEventListener('keydown', handleGlobalKeydown);
   if (noticeTimer) window.clearTimeout(noticeTimer);
   if (agentSnapshotTimer) window.clearInterval(agentSnapshotTimer);
   unlistenAgentState?.();
@@ -860,7 +911,7 @@ async function getTauriWindow() {
 </script>
 
 <template>
-  <div class="app-frame" :class="{ ready: appReady }">
+  <div class="app-frame" :class="{ ready: appReady }" :aria-busy="powerLoading">
     <header class="titlebar" data-tauri-drag-region @pointerdown="startWindowDrag">
       <div class="brand" data-tauri-drag-region>
         <div class="brand-mark">
@@ -870,7 +921,15 @@ async function getTauriWindow() {
       </div>
 
       <div class="title-status">
-        <button class="mode-toggle" :class="{ enabled: automatic }" @click="toggleAutomatic">
+        <button
+          class="mode-toggle"
+          :class="{ enabled: automatic }"
+          role="switch"
+          :aria-checked="automatic"
+          :disabled="powerLoading"
+          aria-label="Cambio automatico de planes"
+          @click="toggleAutomatic"
+        >
           <span class="mode-dot"></span>
           <span>Automático</span>
           <strong>{{ automatic ? 'ON' : 'OFF' }}</strong>
@@ -902,7 +961,7 @@ async function getTauriWindow() {
     <section class="command-strip">
       <label class="search-box">
         <Search :size="20" />
-        <input v-model="query" type="search" placeholder="Buscar juego..." />
+        <input v-model="query" type="search" placeholder="Buscar juego..." aria-label="Buscar perfil" />
       </label>
 
       <button class="primary-action" :disabled="powerLoading" @click="autoDetectProfiles">
@@ -943,30 +1002,32 @@ async function getTauriWindow() {
           <div
             v-for="game in filteredGames"
             :key="game.id"
-            role="button"
-            tabindex="0"
             class="game-row"
             :class="{ selected: game.id === selectedId, active: game.status === 'active', disabled: game.status === 'disabled' }"
-            @click="selectedId = game.id"
-            @keydown.enter="selectedId = game.id"
-            @keydown.space.prevent="selectedId = game.id"
           >
-            <span class="row-state"></span>
-            <span class="game-icon" :class="{ [game.iconClass]: !profileIcons[game.id] }">
-              <img v-if="profileIcons[game.id]" :src="profileIcons[game.id]" alt="" />
-              <template v-else>{{ game.iconText }}</template>
-            </span>
-            <span class="game-copy">
-              <strong>{{ game.name }}</strong>
-              <small>{{ game.exe }}</small>
-            </span>
-            <span class="row-meta">
-              <span class="level-badge" :class="game.level">{{ levelLabel(game.level) }}</span>
-              <span class="state-label" :class="game.status">
-                <span></span>
-                {{ game.status === 'active' ? game.lastEvent : statusLabel(game.status) }}
+            <button
+              class="game-select"
+              :aria-pressed="game.id === selectedId"
+              :aria-label="`Seleccionar ${game.name}`"
+              @click="selectedId = game.id"
+            >
+              <span class="row-state"></span>
+              <span class="game-icon" :class="{ [game.iconClass]: !profileIcons[game.id] }">
+                <img v-if="profileIcons[game.id]" :src="profileIcons[game.id]" alt="" />
+                <template v-else>{{ game.iconText }}</template>
               </span>
-            </span>
+              <span class="game-copy">
+                <strong>{{ game.name }}</strong>
+                <small>{{ game.exe }}</small>
+              </span>
+              <span class="row-meta">
+                <span class="level-badge" :class="game.level">{{ levelLabel(game.level) }}</span>
+                <span class="state-label" :class="game.status">
+                  <span></span>
+                  {{ game.status === 'active' ? game.lastEvent : statusLabel(game.status) }}
+                </span>
+              </span>
+            </button>
             <button class="row-action" :disabled="powerLoading" aria-label="Eliminar perfil" @click.stop="deleteProfile(game.id)">
               <Trash2 :size="17" />
             </button>
@@ -980,7 +1041,17 @@ async function getTauriWindow() {
             <Zap :size="32" stroke-width="2.7" fill="currentColor" />
           </div>
           <strong>No hay perfil seleccionado</strong>
-          <span>La configuracion real esta vacia. El siguiente paso es activar Agregar exe.</span>
+          <span>Agrega un ejecutable o detecta una aplicacion abierta.</span>
+          <div class="empty-actions">
+            <button class="primary-action compact" :disabled="powerLoading" @click="addExecutableProfile">
+              <FilePlus2 :size="17" />
+              <span>Agregar exe</span>
+            </button>
+            <button class="secondary-action compact" :disabled="powerLoading" @click="autoDetectProfiles">
+              <Sparkles :size="17" />
+              <span>Auto detectar</span>
+            </button>
+          </div>
         </div>
 
         <template v-else>
@@ -995,14 +1066,15 @@ async function getTauriWindow() {
               <span>Nombre del juego</span>
               <input
                 :value="selectedGame.name"
+                :disabled="powerLoading"
                 @change="persistSelectedProfile({ name: ($event.target as HTMLInputElement).value })"
               />
             </label>
             <label>
               <span>Ejecutable</span>
               <div class="path-field">
-                <input :value="selectedGame.path" readonly />
-                <button class="square-tool" aria-label="Abrir carpeta del ejecutable" @click="openSelectedExecutableFolder">
+                <input :value="selectedGame.path" :title="selectedGame.path" readonly />
+                <button class="square-tool" :disabled="powerLoading" aria-label="Abrir carpeta del ejecutable" @click="openSelectedExecutableFolder">
                   <Folder :size="20" />
                 </button>
               </div>
@@ -1017,6 +1089,9 @@ async function getTauriWindow() {
               <button
                 class="switch"
                 :class="{ on: selectedGame.enabled }"
+                role="switch"
+                :aria-checked="selectedGame.enabled"
+                :disabled="powerLoading"
                 aria-label="Activar perfil"
                 @click="persistSelectedProfile({ enabled: !selectedGame.enabled })"
               >
@@ -1028,6 +1103,7 @@ async function getTauriWindow() {
               <span>Plan al iniciar</span>
               <select
                 :value="selectedGame.startPlan"
+                :disabled="powerLoading"
                 @change="updateSelectedGame('startPlan', ($event.target as HTMLSelectElement).value)"
               >
                 <option v-for="plan in powerPlanOptions" :key="`start-${plan.id}`" :value="plan.id">
@@ -1040,6 +1116,7 @@ async function getTauriWindow() {
               <span>Al cerrar</span>
               <select
                 :value="selectedGame.closePlan"
+                :disabled="powerLoading"
                 @change="updateSelectedGame('closePlan', ($event.target as HTMLSelectElement).value)"
               >
                 <option v-for="plan in powerPlanOptions" :key="`close-${plan.id}`" :value="plan.id">
@@ -1053,12 +1130,12 @@ async function getTauriWindow() {
               <span>Retardo al cerrar</span>
               <select
                 :value="selectedGame.closeDelay"
+                :disabled="powerLoading"
                 @change="updateSelectedGame('closeDelay', ($event.target as HTMLSelectElement).value)"
               >
-                <option>15 s</option>
-                <option>30 s</option>
-                <option>45 s</option>
-                <option>60 s</option>
+                <option v-for="delay in closeDelayOptions" :key="delay" :value="delay">
+                  {{ delay === '0 s' ? 'Sin retardo' : delay }}
+                </option>
               </select>
             </label>
 
@@ -1070,7 +1147,9 @@ async function getTauriWindow() {
               <button
                 class="switch"
                 :class="{ on: selectedGame.notify && globalNotificationsEnabled }"
-                :disabled="!globalNotificationsEnabled"
+                :disabled="!globalNotificationsEnabled || powerLoading"
+                role="switch"
+                :aria-checked="selectedGame.notify && globalNotificationsEnabled"
                 aria-label="Mostrar notificación"
                 @click="persistSelectedProfile({ notify: !selectedGame.notify })"
               >
@@ -1080,21 +1159,27 @@ async function getTauriWindow() {
 
             <div class="process-list">
               <div class="process-title">Procesos asociados</div>
-              <button
-                v-for="process in selectedGame.processes"
-                :key="process"
-                class="process-row"
-                :disabled="process.toLowerCase() === selectedGame.exe.toLowerCase() || powerLoading"
-                @click="removeAssociatedProcess(process)"
-              >
-                <Cpu :size="15" />
-                <span>{{ process }}</span>
-                <Trash2 v-if="process.toLowerCase() !== selectedGame.exe.toLowerCase()" :size="15" />
-                <Menu v-else :size="17" />
-              </button>
+              <template v-for="process in selectedGame.processes" :key="process">
+                <div v-if="process.toLowerCase() === selectedGame.exe.toLowerCase()" class="process-row primary-process-row">
+                  <Cpu :size="15" />
+                  <span>{{ process }}</span>
+                  <small class="process-role">Principal</small>
+                </div>
+                <button
+                  v-else
+                  class="process-row"
+                  :disabled="powerLoading"
+                  :aria-label="`Quitar ${process}`"
+                  @click="removeAssociatedProcess(process)"
+                >
+                  <Cpu :size="15" />
+                  <span>{{ process }}</span>
+                  <Trash2 :size="15" />
+                </button>
+              </template>
             </div>
 
-            <button class="add-process" @click="openAssociateProcessPanel">
+            <button class="add-process" :disabled="powerLoading" @click="openAssociateProcessPanel">
               <Plus :size="18" />
               <span>Agregar proceso</span>
             </button>
@@ -1109,249 +1194,50 @@ async function getTauriWindow() {
       </section>
     </main>
 
-    <section v-if="processPanelOpen" class="process-drawer">
-      <header class="drawer-header">
-        <div>
-          <strong>{{ drawerTitle }}</strong>
-          <span>{{ drawerCount }} detectados</span>
-        </div>
-        <button class="icon-button" aria-label="Cerrar procesos abiertos" @click="processPanelOpen = false">
-          <X :size="18" />
-        </button>
-      </header>
+    <div v-if="drawerOpen" class="drawer-backdrop" aria-hidden="true" @click="closeOpenPanel"></div>
 
-      <label class="drawer-search">
-        <Search :size="18" />
-        <input v-model="processQuery" type="search" placeholder="Filtrar..." />
-      </label>
+    <ProcessDrawer
+      v-if="processPanelOpen"
+      :mode="processDrawerMode"
+      :processes="openProcesses"
+      :candidates="detectedCandidates"
+      :icons="processIcons"
+      :loading="drawerLoading"
+      :busy="powerLoading"
+      @close="processPanelOpen = false"
+      @add-candidate="addDetectedCandidate"
+      @associate="associateOpenProcess"
+      @refresh="refreshDrawer"
+    />
 
-      <div class="drawer-list">
-        <template v-if="processDrawerMode === 'candidates'">
-          <div v-if="drawerLoading" class="drawer-empty">
-            <strong>Buscando procesos</strong>
-            <span>Detectando candidatos abiertos...</span>
-          </div>
-          <div v-else-if="filteredCandidates.length === 0" class="drawer-empty">
-            <strong>Sin candidatos</strong>
-            <span>Abre un juego y vuelve a ejecutar la detección.</span>
-          </div>
-          <div v-for="candidate in drawerLoading ? [] : filteredCandidates" :key="candidate.id" class="open-process-row candidate-row">
-            <span class="drawer-app-icon">
-              <img v-if="processIcons[candidateIconKey(candidate)]" :src="processIcons[candidateIconKey(candidate)]" alt="" />
-              <Cpu v-else :size="15" />
-            </span>
-            <span>
-              <strong>{{ candidate.name }}</strong>
-              <small>{{ candidate.executablePath }}</small>
-            </span>
-            <button class="mini-add" :disabled="powerLoading" @click="addDetectedCandidate(candidate)">Agregar</button>
-          </div>
-        </template>
+    <SettingsDrawer
+      v-if="settingsPanelOpen && currentConfig"
+      :config="currentConfig"
+      :agent-task-ready="agentTaskReady"
+      :agent-status-text="agentStatusText"
+      :agent-status-tone="agentStatusTone"
+      :elevated-agent-action-label="elevatedAgentActionLabel"
+      :power-loading="powerLoading"
+      :agent-setup-loading="agentSetupLoading"
+      :app-version="appVersion"
+      @close="settingsPanelOpen = false"
+      @toggle-automation="toggleAutomatic"
+      @update-settings="persistAppSettings"
+      @agent-action="handleElevatedAgentAction"
+      @open-events="toggleEventsPanel"
+      @open-github="openGithubProfile"
+    />
 
-        <template v-else>
-          <div v-if="drawerLoading" class="drawer-empty">
-            <strong>Leyendo procesos</strong>
-            <span>Actualizando lista...</span>
-          </div>
-          <div v-for="process in drawerLoading ? [] : filteredOpenProcesses" :key="`${process.pid}-${process.name}`" class="open-process-row">
-            <span class="drawer-app-icon">
-              <img v-if="processIcons[processIconKey(process)]" :src="processIcons[processIconKey(process)]" alt="" />
-              <Cpu v-else :size="15" />
-            </span>
-            <span>
-              <strong>{{ process.name }}</strong>
-              <small>{{ process.path ?? `PID ${process.pid}` }}</small>
-            </span>
-            <button
-              v-if="processDrawerMode === 'associate'"
-              class="mini-add"
-              :disabled="powerLoading"
-              @click="associateOpenProcess(process)"
-            >
-              Asociar
-            </button>
-            <small v-else>{{ process.pid }}</small>
-          </div>
-        </template>
-      </div>
+    <EventsDrawer
+      v-if="eventsPanelOpen"
+      :events="recentEvents"
+      :loading="powerLoading"
+      @close="eventsPanelOpen = false"
+      @clear="clearEventHistory"
+      @refresh="refreshRecentEvents"
+    />
 
-      <footer class="drawer-footer">
-        <button class="secondary-action" :disabled="powerLoading || drawerLoading" @click="refreshDrawer">
-          <RefreshCw :size="17" />
-          <span>{{ drawerLoading ? 'Actualizando...' : 'Refrescar' }}</span>
-        </button>
-      </footer>
-    </section>
-
-    <section v-if="settingsPanelOpen" class="settings-drawer">
-      <header class="drawer-header">
-        <div>
-          <strong>Configuración</strong>
-          <span>Preferencias generales</span>
-        </div>
-        <button class="icon-button" aria-label="Cerrar configuracion" @click="settingsPanelOpen = false">
-          <X :size="18" />
-        </button>
-      </header>
-
-      <div class="settings-list" v-if="currentConfig">
-        <div class="setting-line">
-          <span>
-            <strong>Automatización</strong>
-            <small>Cambiar planes automaticamente</small>
-          </span>
-          <button
-            class="switch"
-            :class="{ on: currentConfig.automation.enabled }"
-            @click="toggleAutomatic"
-          >
-            <span></span>
-          </button>
-        </div>
-
-        <div class="setting-line">
-          <span>
-            <strong>Notificaciones</strong>
-            <small>Permitir avisos del agente y perfiles nuevos</small>
-          </span>
-          <button
-            class="switch"
-            :class="{ on: currentConfig.automation.notifications_enabled }"
-            @click="persistAppSettings({ notificationsEnabled: !currentConfig.automation.notifications_enabled })"
-          >
-            <span></span>
-          </button>
-        </div>
-
-        <div class="setting-line">
-          <span>
-            <strong>Iniciar con Windows</strong>
-            <small>Arranca el agente y la bandeja al iniciar sesion</small>
-          </span>
-          <button
-            class="switch"
-            :class="{ on: currentConfig.agent.start_with_windows }"
-            @click="persistAppSettings({ startWithWindows: !currentConfig.agent.start_with_windows })"
-          >
-            <span></span>
-          </button>
-        </div>
-
-        <div class="setting-line">
-          <span>
-            <strong>Iniciar en segundo plano</strong>
-            <small>No abrir la ventana principal al iniciar</small>
-          </span>
-          <button
-            class="switch"
-            :class="{ on: currentConfig.agent.start_minimized }"
-            @click="persistAppSettings({ startMinimized: !currentConfig.agent.start_minimized })"
-          >
-            <span></span>
-          </button>
-        </div>
-
-        <div class="setting-line">
-          <span>
-            <strong>Icono en bandeja</strong>
-            <small>Mantener el tray liviano para abrir PowerShift</small>
-          </span>
-          <button
-            class="switch"
-            :class="{ on: currentConfig.agent.show_tray_icon }"
-            @click="persistAppSettings({ showTrayIcon: !currentConfig.agent.show_tray_icon })"
-          >
-            <span></span>
-          </button>
-        </div>
-
-        <div class="setting-line">
-          <span>
-            <strong>Agente elevado</strong>
-            <small>{{ agentTaskReady ? agentStatusText : 'Requerido para eventos WMI de procesos' }}</small>
-          </span>
-          <button class="secondary-action compact" :disabled="powerLoading || agentSetupLoading" @click="handleElevatedAgentAction">
-            <RefreshCw v-if="agentTaskReady && agentStatusTone === 'ready'" :size="16" />
-            <Play v-else :size="16" />
-            <span>{{ elevatedAgentActionLabel }}</span>
-          </button>
-        </div>
-
-        <div class="setting-line">
-          <span>
-            <strong>Historial de eventos</strong>
-            <small>Diagnóstico y cambios recientes</small>
-          </span>
-          <button class="secondary-action compact" :disabled="powerLoading" @click="toggleEventsPanel">
-            <List :size="16" />
-            <span>Abrir</span>
-          </button>
-        </div>
-
-        <label class="select-field">
-          <span>Botón X</span>
-          <select
-            :value="currentConfig.ui.close_button_behavior"
-            @change="persistAppSettings({ closeButtonBehavior: ($event.target as HTMLSelectElement).value })"
-          >
-            <option value="hide_window">Cerrar solo ventana</option>
-            <option value="exit_app">Salir de PowerShift</option>
-          </select>
-        </label>
-
-        <div class="settings-about">
-          <span>PowerShift{{ appVersion ? ` v${appVersion}` : '' }}</span>
-          <button class="secondary-action compact" @click="openGithubProfile">
-            <svg class="github-mark" viewBox="0 0 16 16" aria-hidden="true">
-              <path
-                fill="currentColor"
-                d="M8 0.2a8 8 0 0 0-2.5 15.6c0.4 0.1 0.5-0.2 0.5-0.4v-1.4c-2.2 0.5-2.7-0.9-2.7-0.9-0.4-0.9-0.9-1.1-0.9-1.1-0.7-0.5 0.1-0.5 0.1-0.5 0.8 0.1 1.2 0.8 1.2 0.8 0.7 1.2 1.9 0.9 2.3 0.7 0.1-0.5 0.3-0.9 0.5-1.1-1.8-0.2-3.6-0.9-3.6-3.9 0-0.9 0.3-1.6 0.8-2.1-0.1-0.2-0.4-1 0.1-2.1 0 0 0.7-0.2 2.2 0.8a7.6 7.6 0 0 1 4 0c1.5-1 2.2-0.8 2.2-0.8 0.5 1.1 0.2 1.9 0.1 2.1 0.5 0.6 0.8 1.3 0.8 2.1 0 3-1.8 3.7-3.6 3.9 0.3 0.2 0.6 0.7 0.6 1.5v2.1c0 0.2 0.1 0.5 0.6 0.4A8 8 0 0 0 8 0.2Z"
-              />
-            </svg>
-            <span>GitHub</span>
-          </button>
-        </div>
-      </div>
-    </section>
-
-    <section v-if="eventsPanelOpen" class="events-drawer">
-      <header class="drawer-header">
-        <div>
-          <strong>Eventos</strong>
-          <span>{{ recentEvents.length }} recientes</span>
-        </div>
-        <button class="icon-button" aria-label="Cerrar eventos" @click="eventsPanelOpen = false">
-          <X :size="18" />
-        </button>
-      </header>
-
-      <div class="event-list">
-        <div v-if="recentEvents.length === 0" class="drawer-empty">
-          <strong>Sin eventos</strong>
-          <span>El agente registrará cambios de plan, restauraciones y errores aquí.</span>
-        </div>
-        <div v-for="event in recentEvents" :key="`${event.timestamp_ms}-${event.kind}-${event.message}`" class="event-row">
-          <span class="event-dot" :class="event.level"></span>
-          <span class="event-copy">
-            <strong>{{ event.message }}</strong>
-            <small>{{ formatEventTime(event.timestamp_ms) }} · {{ eventKindLabel(event.kind) }}</small>
-          </span>
-        </div>
-      </div>
-
-      <footer class="drawer-footer">
-        <button class="secondary-action danger" :disabled="powerLoading || recentEvents.length === 0" @click="clearEventHistory">
-          <Trash2 :size="17" />
-          <span>Borrar historial</span>
-        </button>
-        <button class="secondary-action" :disabled="powerLoading" @click="refreshRecentEvents">
-          <RefreshCw :size="17" />
-          <span>Refrescar</span>
-        </button>
-      </footer>
-    </section>
-
-    <footer class="statusbar">
+    <footer class="statusbar" aria-live="polite">
       <div class="listener-state" :class="agentStatusTone">
         <Activity :size="18" />
         <span>{{ powerError ? powerError : agentStatusText }}</span>
@@ -1360,9 +1246,18 @@ async function getTauriWindow() {
       </div>
     </footer>
 
-    <div v-if="notice" class="toast" :class="notice.kind">
+    <div v-if="notice" class="toast" :class="notice.kind" role="status" aria-live="polite">
       <CheckCircle2 :size="17" />
       <span>{{ notice.message }}</span>
     </div>
+
+    <ConfirmDialog
+      :open="Boolean(confirmation)"
+      :title="confirmation?.title ?? ''"
+      :message="confirmation?.message ?? ''"
+      :confirm-label="confirmation?.confirmLabel ?? ''"
+      @cancel="confirmation = null"
+      @confirm="confirmPendingAction"
+    />
   </div>
 </template>

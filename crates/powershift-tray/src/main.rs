@@ -491,13 +491,14 @@ mod tray {
             return true;
         }
 
-        let Some(profile_name) = event
+        let profile_id = event.get("profile_id").and_then(serde_json::Value::as_str);
+        let profile_name = event
             .get("profile_name")
-            .and_then(serde_json::Value::as_str)
-        else {
+            .and_then(serde_json::Value::as_str);
+        if profile_id.is_none() && profile_name.is_none() {
             return false;
-        };
-        let Some(profile) = find_profile_by_name(config, profile_name) else {
+        }
+        let Some(profile) = find_profile(config, profile_id, profile_name) else {
             return true;
         };
 
@@ -517,16 +518,31 @@ mod tray {
             .unwrap_or(true)
     }
 
-    fn find_profile_by_name<'a>(
+    fn find_profile<'a>(
         config: Option<&'a serde_json::Value>,
-        profile_name: &str,
+        profile_id: Option<&str>,
+        profile_name: Option<&str>,
     ) -> Option<&'a serde_json::Value> {
-        config?.get("profiles")?.as_array()?.iter().find(|profile| {
-            profile
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|name| name.eq_ignore_ascii_case(profile_name))
-        })
+        let profiles = config?.get("profiles")?.as_array()?;
+        profile_id
+            .and_then(|profile_id| {
+                profiles.iter().find(|profile| {
+                    profile
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| id == profile_id)
+                })
+            })
+            .or_else(|| {
+                profile_name.and_then(|profile_name| {
+                    profiles.iter().find(|profile| {
+                        profile
+                            .get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|name| name.eq_ignore_ascii_case(profile_name))
+                    })
+                })
+            })
     }
 
     fn spawn_quit_listener(hwnd: HWND) {
@@ -809,16 +825,19 @@ mod tests {
             "timestamp_ms": 1,
             "kind": "profile_activated",
             "message": "Apex activo",
+            "profile_id": "apex-main",
             "profile_name": "Apex Legends"
         });
         let enabled_config = serde_json::json!({
             "profiles": [{
+                "id": "apex-main",
                 "name": "Apex Legends",
                 "notifications": { "on_activate": true, "on_restore": true, "on_error": true }
             }]
         });
         let disabled_config = serde_json::json!({
             "profiles": [{
+                "id": "apex-main",
                 "name": "Apex Legends",
                 "notifications": { "on_activate": false, "on_restore": true, "on_error": true }
             }]
@@ -832,6 +851,33 @@ mod tests {
             &event,
             Some(&disabled_config)
         ));
+    }
+
+    #[test]
+    fn tray_notification_prefers_profile_id_when_names_collide() {
+        let event = serde_json::json!({
+            "timestamp_ms": 1,
+            "kind": "profile_activated",
+            "message": "Juego activo",
+            "profile_id": "quiet-copy",
+            "profile_name": "Juego"
+        });
+        let config = serde_json::json!({
+            "profiles": [
+                {
+                    "id": "loud-copy",
+                    "name": "Juego",
+                    "notifications": { "on_activate": true, "on_restore": true, "on_error": true }
+                },
+                {
+                    "id": "quiet-copy",
+                    "name": "Juego",
+                    "notifications": { "on_activate": false, "on_restore": false, "on_error": true }
+                }
+            ]
+        });
+
+        assert!(!super::tray::should_notify_event(&event, Some(&config)));
     }
 
     #[test]

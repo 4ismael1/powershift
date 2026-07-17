@@ -2,12 +2,31 @@ use crate::{PowerError, PowerManagerBackend, PowerResult};
 use powershift_core::PowerPlan;
 use std::process::Command;
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn powercfg_command() -> Command {
+    let mut command = Command::new("powercfg");
+    configure_quiet_command(&mut command);
+    command
+}
+
+#[cfg(windows)]
+fn configure_quiet_command(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn configure_quiet_command(_command: &mut Command) {}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PowerCfgBackend;
 
 impl PowerManagerBackend for PowerCfgBackend {
     fn list_plans(&self) -> PowerResult<Vec<PowerPlan>> {
-        let output = Command::new("powercfg").arg("/L").output()?;
+        let output = powercfg_command().arg("/L").output()?;
         if !output.status.success() {
             return Err(PowerError::CommandFailed {
                 command: "powercfg /L",
@@ -21,7 +40,7 @@ impl PowerManagerBackend for PowerCfgBackend {
     }
 
     fn active_plan(&self) -> PowerResult<PowerPlan> {
-        let output = Command::new("powercfg").arg("/GETACTIVESCHEME").output()?;
+        let output = powercfg_command().arg("/GETACTIVESCHEME").output()?;
         if !output.status.success() {
             return Err(PowerError::CommandFailed {
                 command: "powercfg /GETACTIVESCHEME",
@@ -38,7 +57,7 @@ impl PowerManagerBackend for PowerCfgBackend {
     }
 
     fn set_active_plan(&self, plan_id: &str) -> PowerResult<()> {
-        let output = Command::new("powercfg").args(["/S", plan_id]).output()?;
+        let output = powercfg_command().args(["/S", plan_id]).output()?;
         if output.status.success() {
             Ok(())
         } else {
@@ -183,5 +202,14 @@ GUID de plan de energia: a1841308-3541-4fab-bc81-f71556f20b4a  (Economizador)
             normalize_guid("{381B4222-F694-41F0-9685-FF5BB260DF2E}"),
             "381b4222-f694-41f0-9685-ff5bb260df2e"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powercfg_fallback_is_explicitly_hidden() {
+        let source = include_str!("powercfg.rs");
+
+        assert!(source.contains("creation_flags(CREATE_NO_WINDOW)"));
+        assert!(!source.contains("Command::new(\"powercfg\").arg"));
     }
 }

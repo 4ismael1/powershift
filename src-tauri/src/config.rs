@@ -1,9 +1,13 @@
 use powershift_core::{AppConfig, ConfigStore};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tauri::{AppHandle, Manager};
 
 const TRAY_EXE_NAME: &str = "powershift-tray.exe";
+const CONFIG_RECOVERY_NOTICE_FILE: &str = "config-recovery.notice";
+const CONFIG_RECOVERY_MESSAGE: &str =
+    "La configuración estaba dañada. PowerShift conservó una copia y creó una configuración segura.";
 const LEGACY_RUNTIME_FILES: [&str; 4] = [
     "agent-state.json",
     "agent-control.token",
@@ -25,7 +29,15 @@ pub fn default_config_path() -> PathBuf {
 pub fn load_or_create_config(path: PathBuf) -> Result<AppConfig, String> {
     cleanup_legacy_runtime_files(path.parent());
     if path.exists() {
-        let config = ConfigStore::load_recovering(&path).map_err(|error| error.to_string())?;
+        if config_uses_future_schema(&path) {
+            return Err(
+                "La configuración pertenece a una versión más reciente de PowerShift.".to_string(),
+            );
+        }
+        let config = match ConfigStore::load_recovering(&path) {
+            Ok(config) => config,
+            Err(error) => recover_unreadable_config(&path, error.to_string())?,
+        };
         let input = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
         let file_version = config_version_from_json(&input);
 
@@ -39,6 +51,75 @@ pub fn load_or_create_config(path: PathBuf) -> Result<AppConfig, String> {
     let config = AppConfig::default();
     save_config_to_path(path, &config)?;
     Ok(config)
+}
+
+fn recover_unreadable_config(path: &Path, load_error: String) -> Result<AppConfig, String> {
+    if config_or_backup_uses_future_schema(path) {
+        return Err(format!(
+            "La configuración pertenece a una versión más reciente de PowerShift. {load_error}"
+        ));
+    }
+
+    quarantine_corrupt_config(path).map_err(|error| {
+        format!("{load_error}. No se pudo conservar la configuración dañada: {error}")
+    })?;
+    let config = AppConfig::default();
+    save_config_to_path(path.to_path_buf(), &config)?;
+    write_config_recovery_notice(path);
+    Ok(config)
+}
+
+fn config_or_backup_uses_future_schema(path: &Path) -> bool {
+    [path.to_path_buf(), config_backup_path(path)]
+        .iter()
+        .any(|candidate| config_uses_future_schema(candidate))
+}
+
+fn config_uses_future_schema(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|input| config_version_from_json(&input))
+        .is_some_and(|version| version > powershift_core::CURRENT_CONFIG_VERSION)
+}
+
+fn config_backup_path(path: &Path) -> PathBuf {
+    let mut backup = path.as_os_str().to_os_string();
+    backup.push(".bak");
+    PathBuf::from(backup)
+}
+
+fn quarantine_corrupt_config(path: &Path) -> Result<(), String> {
+    let quarantine = corrupt_config_path(path);
+    match std::fs::remove_file(&quarantine) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    std::fs::rename(path, quarantine).map_err(|error| error.to_string())
+}
+
+fn corrupt_config_path(path: &Path) -> PathBuf {
+    let mut corrupt = path.as_os_str().to_os_string();
+    corrupt.push(".corrupt");
+    PathBuf::from(corrupt)
+}
+
+fn write_config_recovery_notice(config_path: &Path) {
+    let Some(parent) = config_path.parent() else {
+        return;
+    };
+    let _ = powershift_core::write_file_atomically(
+        parent.join(CONFIG_RECOVERY_NOTICE_FILE),
+        CONFIG_RECOVERY_MESSAGE.as_bytes(),
+    );
+}
+
+fn take_config_recovery_notice(config_path: &Path) -> Option<String> {
+    let path = config_path.parent()?.join(CONFIG_RECOVERY_NOTICE_FILE);
+    let notice = std::fs::read_to_string(&path).ok()?;
+    let _ = std::fs::remove_file(path);
+    let notice = notice.trim();
+    (!notice.is_empty()).then(|| notice.to_string())
 }
 
 fn cleanup_legacy_runtime_files(config_dir: Option<&Path>) {
@@ -81,17 +162,27 @@ fn validate_config_for_save(config: &AppConfig) -> Result<(), String> {
 pub fn sync_startup_shell_settings(app: &AppHandle) -> Result<(), String> {
     let config = load_or_create_config(default_config_path())?;
 
+    let mut warnings = Vec::new();
+
     if should_sync_autostart_at_startup(cfg!(debug_assertions)) {
-        sync_tray_autostart(app, &config)?;
+        collect_sync_warning(
+            &mut warnings,
+            "inicio de la bandeja",
+            sync_tray_autostart(app, &config),
+        );
     }
     if config.agent.show_tray_icon {
-        let _ = start_tray_process(app);
+        collect_sync_warning(&mut warnings, "proceso de bandeja", start_tray_process(app));
     }
     if config.agent.enabled {
-        let _ = crate::agent_control::ensure_agent_running();
+        collect_sync_warning(
+            &mut warnings,
+            "agente",
+            crate::agent_control::ensure_agent_running(),
+        );
     }
 
-    Ok(())
+    sync_warnings_result(warnings)
 }
 
 fn should_sync_autostart_at_startup(debug_build: bool) -> bool {
@@ -104,31 +195,89 @@ pub fn get_app_config() -> Result<AppConfig, String> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn save_app_config(app: AppHandle, config: AppConfig) -> Result<(), String> {
+pub fn take_config_recovery_warning() -> Result<Option<String>, String> {
+    Ok(take_config_recovery_notice(&default_config_path()))
+}
+
+#[tauri::command(rename_all = "snake_case")]
+pub fn save_app_config(app: AppHandle, config: AppConfig) -> Result<ConfigSaveOutcome, String> {
     let previous = load_or_create_config(default_config_path()).ok();
     let startup_changed = previous
         .as_ref()
         .map(|previous| previous.agent.start_with_windows != config.agent.start_with_windows)
         .unwrap_or(true);
 
-    validate_config_for_save(&config)?;
-    sync_tray_autostart(&app, &config)?;
-    if startup_changed {
-        crate::agent_control::sync_agent_startup_task(&app, config.agent.start_with_windows)?;
+    persist_config_then_sync(default_config_path(), &config, |warnings| {
+        collect_sync_warning(
+            warnings,
+            "inicio de la bandeja",
+            sync_tray_autostart(&app, &config),
+        );
+        if startup_changed {
+            collect_sync_warning(
+                warnings,
+                "inicio del agente",
+                crate::agent_control::sync_agent_startup_task(
+                    &app,
+                    config.agent.start_with_windows,
+                ),
+            );
+        }
+        collect_sync_warning(
+            warnings,
+            "proceso de bandeja",
+            sync_running_tray(&app, &config),
+        );
+        if should_request_agent_rescan(previous.as_ref(), &config) {
+            request_agent_rescan_after_config_save();
+        }
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfigSaveOutcome {
+    pub warnings: Vec<String>,
+}
+
+fn collect_sync_warning(warnings: &mut Vec<String>, component: &str, result: Result<(), String>) {
+    if let Err(error) = result {
+        warnings.push(format!("No se pudo sincronizar {component}: {error}"));
     }
-    save_config_to_path(default_config_path(), &config)?;
-    sync_running_tray(&app, &config)?;
-    crate::windowing::sync_tray_visibility(&app, config.agent.show_tray_icon)?;
-    if should_request_agent_rescan(previous.as_ref(), &config) {
-        request_agent_rescan_after_config_save();
+}
+
+fn persist_config_then_sync(
+    path: PathBuf,
+    config: &AppConfig,
+    sync: impl FnOnce(&mut Vec<String>),
+) -> Result<ConfigSaveOutcome, String> {
+    validate_config_for_save(config)?;
+    save_config_to_path(path, config)?;
+
+    let mut warnings = Vec::new();
+    sync(&mut warnings);
+    Ok(ConfigSaveOutcome { warnings })
+}
+
+fn sync_warnings_result(warnings: Vec<String>) -> Result<(), String> {
+    if warnings.is_empty() {
+        Ok(())
+    } else {
+        Err(warnings.join("; "))
     }
-    Ok(())
 }
 
 fn should_request_agent_rescan(previous: Option<&AppConfig>, next: &AppConfig) -> bool {
-    previous
-        .map(|previous| previous.agent.enabled || next.agent.enabled)
-        .unwrap_or(next.agent.enabled)
+    let Some(previous) = previous else {
+        return next.agent.enabled && next.automation.enabled;
+    };
+
+    if previous.agent.enabled != next.agent.enabled
+        || previous.automation.enabled != next.automation.enabled
+    {
+        return true;
+    }
+
+    next.agent.enabled && next.automation.enabled && previous.profiles != next.profiles
 }
 
 fn request_agent_rescan_after_config_save() {
@@ -347,29 +496,109 @@ mod tests {
     }
 
     #[test]
-    fn config_save_validates_and_syncs_external_state_before_persisting() {
-        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("config.rs");
-        let source = std::fs::read_to_string(source_path).expect("read source");
-        let save_body = source
-            .split("pub fn save_app_config")
-            .nth(1)
-            .and_then(|source| source.split("fn should_request_agent_rescan").next())
-            .expect("save_app_config body");
+    fn corrupt_config_without_backup_is_quarantined_and_recovered() {
+        let path = temp_config_path("corrupt-recovery");
+        let parent = path.parent().expect("temp parent");
+        let corrupt = corrupt_config_path(&path);
+        let notice = parent.join(CONFIG_RECOVERY_NOTICE_FILE);
+        let backup = config_backup_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&corrupt);
+        let _ = std::fs::remove_file(&notice);
+        let _ = std::fs::remove_file(&backup);
+        std::fs::write(&path, b"{invalid").expect("seed corrupt config");
 
-        let validate_index = save_body
-            .find("validate_config_for_save(&config)?")
-            .expect("validation call");
-        let autostart_index = save_body
-            .find("sync_tray_autostart(&app, &config)?")
-            .expect("autostart sync call");
-        let persist_index = save_body
-            .find("save_config_to_path(default_config_path(), &config)?")
-            .expect("config persist call");
+        let recovered = load_or_create_config(path.clone()).expect("recover config");
 
-        assert!(validate_index < autostart_index);
-        assert!(autostart_index < persist_index);
+        assert_eq!(recovered, AppConfig::default());
+        assert_eq!(
+            ConfigStore::load(&path).expect("valid replacement"),
+            recovered
+        );
+        assert_eq!(
+            std::fs::read_to_string(&corrupt).expect("quarantine"),
+            "{invalid"
+        );
+        assert_eq!(
+            take_config_recovery_notice(&path).as_deref(),
+            Some(CONFIG_RECOVERY_MESSAGE)
+        );
+        assert!(take_config_recovery_notice(&path).is_none());
+
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(corrupt);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn future_config_is_never_overwritten_by_recovery() {
+        let path = temp_config_path("future-schema");
+        let corrupt = corrupt_config_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&corrupt);
+        let future = format!(
+            "{{\"version\":{},\"profiles\":[]}}",
+            powershift_core::CURRENT_CONFIG_VERSION + 1
+        );
+        std::fs::write(&path, &future).expect("seed future config");
+
+        let error = load_or_create_config(path.clone()).expect_err("reject future config");
+
+        assert!(error.contains("versión más reciente"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("preserved future config"),
+            future
+        );
+        assert!(!corrupt.exists());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_save_persists_before_syncing_external_state() {
+        let path = temp_config_path("persist-before-sync");
+        let _ = std::fs::remove_file(&path);
+        let config = AppConfig::default();
+        let mut observed_persisted_config = false;
+
+        let outcome = persist_config_then_sync(path.clone(), &config, |warnings| {
+            observed_persisted_config = ConfigStore::load(&path)
+                .map(|persisted| persisted == config)
+                .unwrap_or(false);
+            collect_sync_warning(warnings, "prueba", Err("fallo externo".to_string()));
+        })
+        .expect("persist config");
+
+        assert!(observed_persisted_config);
+        assert_eq!(outcome.warnings.len(), 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn external_sync_failures_are_reported_as_non_destructive_warnings() {
+        let mut warnings = Vec::new();
+
+        collect_sync_warning(
+            &mut warnings,
+            "agente",
+            Err("tarea no disponible".to_string()),
+        );
+        collect_sync_warning(&mut warnings, "bandeja", Ok(()));
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("agente"));
+        assert!(warnings[0].contains("tarea no disponible"));
+    }
+
+    #[test]
+    fn startup_sync_reports_all_failures_after_running_every_step() {
+        let result = sync_warnings_result(vec![
+            "bandeja fallida".to_string(),
+            "agente fallido".to_string(),
+        ])
+        .expect_err("combined startup warning");
+
+        assert!(result.contains("bandeja fallida"));
+        assert!(result.contains("agente fallido"));
     }
 
     #[test]
@@ -469,5 +698,44 @@ mod tests {
         previous.agent.enabled = false;
         next.agent.enabled = false;
         assert!(!should_request_agent_rescan(Some(&previous), &next));
+    }
+
+    #[test]
+    fn config_save_rescans_only_for_runtime_relevant_changes() {
+        let previous = AppConfig::default();
+
+        let mut profile_change = previous.clone();
+        profile_change.profiles.push(Profile::new(
+            "notepad",
+            "Notepad",
+            "notepad.exe",
+            "balanced",
+        ));
+        assert!(should_request_agent_rescan(
+            Some(&previous),
+            &profile_change
+        ));
+
+        let mut automation_change = previous.clone();
+        automation_change.automation.enabled = false;
+        assert!(should_request_agent_rescan(
+            Some(&previous),
+            &automation_change
+        ));
+
+        let mut notification_change = previous.clone();
+        notification_change.automation.notifications_enabled = false;
+        assert!(!should_request_agent_rescan(
+            Some(&previous),
+            &notification_change
+        ));
+
+        let mut close_button_change = previous.clone();
+        close_button_change.ui.close_button_behavior =
+            powershift_core::CloseButtonBehavior::ExitApp;
+        assert!(!should_request_agent_rescan(
+            Some(&previous),
+            &close_button_change
+        ));
     }
 }

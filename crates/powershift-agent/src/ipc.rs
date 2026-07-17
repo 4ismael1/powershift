@@ -8,9 +8,19 @@ use std::sync::{mpsc::Sender, Arc, Mutex};
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum AgentIpcRequest {
     GetStatus,
-    Reevaluate { token: Option<String> },
-    ClearEvents { token: Option<String> },
-    Shutdown { token: Option<String> },
+    Reevaluate {
+        token: Option<String>,
+    },
+    SetStartup {
+        enabled: bool,
+        token: Option<String>,
+    },
+    ClearEvents {
+        token: Option<String>,
+    },
+    Shutdown {
+        token: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -73,6 +83,20 @@ pub fn request_agent_shutdown_via_ipc() -> Result<(), String> {
         Err(response
             .message
             .unwrap_or_else(|| "El agente no acepto apagarse.".to_string()))
+    }
+}
+
+pub fn request_agent_set_startup_via_ipc(enabled: bool) -> Result<(), String> {
+    let response = call_agent_ipc(AgentIpcRequest::SetStartup {
+        enabled,
+        token: read_control_token_from_app_data(),
+    })?;
+    if response.ok {
+        Ok(())
+    } else {
+        Err(response
+            .message
+            .unwrap_or_else(|| "El agente no pudo cambiar el inicio con Windows.".to_string()))
     }
 }
 
@@ -189,6 +213,31 @@ pub(crate) fn handle_agent_ipc_request(
                     ok: true,
                     state: shared_state.get(),
                     message: Some("Reevaluacion solicitada.".to_string()),
+                },
+                Err(error) => AgentIpcResponse {
+                    ok: false,
+                    state: shared_state.get(),
+                    message: Some(error.to_string()),
+                },
+            }
+        }
+        Ok(AgentIpcRequest::SetStartup { enabled, token }) => {
+            if !control_token_matches(token.as_deref(), control_token) {
+                return agent_ipc_response_json(AgentIpcResponse {
+                    ok: false,
+                    state: shared_state.get(),
+                    message: Some("Token IPC de control invalido.".to_string()),
+                });
+            }
+            match powershift_windows::set_agent_startup_trigger_enabled(enabled) {
+                Ok(()) => AgentIpcResponse {
+                    ok: true,
+                    state: shared_state.get(),
+                    message: Some(if enabled {
+                        "Inicio con Windows habilitado.".to_string()
+                    } else {
+                        "Inicio con Windows deshabilitado.".to_string()
+                    }),
                 },
                 Err(error) => AgentIpcResponse {
                     ok: false,

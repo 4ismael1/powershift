@@ -5,6 +5,7 @@ export interface AgentScanResult {
   matched_profile_id?: string | null;
   matched_profile_name?: string | null;
   target_plan_id?: string | null;
+  restore_profile_id?: string | null;
   restore_profile_name?: string | null;
   active_profiles?: AgentActiveProfile[];
   changed_power_plan: boolean;
@@ -65,17 +66,6 @@ export async function startAgentTask(invokeFn: InvokeFn): Promise<void> {
 
 export async function agentTaskInstalled(invokeFn: InvokeFn): Promise<boolean> {
   return invokeFn<boolean>('agent_task_installed');
-}
-
-export function shouldAutoInstallElevatedAgent(
-  agentEnabled: boolean,
-  taskReady: boolean,
-  runningInTauri: boolean,
-): boolean {
-  void agentEnabled;
-  void taskReady;
-  void runningInTauri;
-  return false;
 }
 
 export function isAgentStateStale(state: PublishedAgentState | null, now = Date.now()): boolean {
@@ -160,6 +150,7 @@ export function agentStateSignature(state: PublishedAgentState | null): string {
     scan?.matched_profile_id ?? '',
     scan?.matched_profile_name ?? '',
     scan?.target_plan_id ?? '',
+    scan?.restore_profile_id ?? '',
     scan?.restore_profile_name ?? '',
     activeProfiles,
     scan?.changed_power_plan ? '1' : '0',

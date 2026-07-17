@@ -1,4 +1,4 @@
-use crate::{AppConfig, MatchMode, RestoreBehavior};
+use crate::{AppConfig, MatchMode, RestoreBehavior, CURRENT_CONFIG_VERSION};
 use std::collections::HashSet;
 
 const MAX_PROFILES: usize = 512;
@@ -42,11 +42,11 @@ pub enum ValidationCode {
 pub fn validate_config(config: &AppConfig) -> Vec<ValidationIssue> {
     let mut issues = Vec::new();
 
-    if config.version == 0 {
+    if config.version == 0 || config.version > CURRENT_CONFIG_VERSION {
         issues.push(ValidationIssue::new(
             ValidationCode::UnsupportedVersion,
             "version",
-            "config version must be at least 1",
+            format!("config version must be between 1 and {CURRENT_CONFIG_VERSION}"),
         ));
     }
 
@@ -89,6 +89,23 @@ pub fn validate_config(config: &AppConfig) -> Vec<ValidationIssue> {
             &format!("{base}.main_executable.name"),
             &mut issues,
         );
+
+        if matches!(
+            profile.activation.match_mode,
+            MatchMode::Path | MatchMode::Folder
+        ) && profile
+            .main_executable
+            .path
+            .as_ref()
+            .map(|path| path.trim().is_empty())
+            .unwrap_or(true)
+        {
+            issues.push(ValidationIssue::new(
+                ValidationCode::MissingPathForPathMatcher,
+                format!("{base}.main_executable.path"),
+                "path or folder activation requires the main executable path",
+            ));
+        }
 
         if profile.power.on_start_plan_id.trim().is_empty() {
             issues.push(ValidationIssue::new(
@@ -223,6 +240,12 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.code == ValidationCode::UnsupportedVersion));
+
+        config.version = CURRENT_CONFIG_VERSION + 1;
+        let issues = validate_config(&config);
+        assert!(issues
+            .iter()
+            .any(|issue| issue.code == ValidationCode::UnsupportedVersion));
     }
 
     #[test]
@@ -299,6 +322,20 @@ mod tests {
         assert!(issues
             .iter()
             .any(|issue| issue.code == ValidationCode::MissingPathForPathMatcher));
+    }
+
+    #[test]
+    fn rejects_main_path_activation_without_executable_path() {
+        let mut config = valid_config();
+        config.profiles[0].activation.match_mode = MatchMode::Folder;
+        config.profiles[0].main_executable.path = None;
+
+        let issues = validate_config(&config);
+
+        assert!(issues.iter().any(|issue| {
+            issue.code == ValidationCode::MissingPathForPathMatcher
+                && issue.path == "profiles[0].main_executable.path"
+        }));
     }
 
     #[test]

@@ -10,6 +10,7 @@ import {
   removeAssociatedProcessFromProfile,
   removeProfileFromConfig,
   saveAppConfig,
+  takeConfigRecoveryWarning,
   updateAppSettingsConfig,
   updateProfileConfig,
   type AppConfig,
@@ -24,21 +25,14 @@ function configWithProfiles(): AppConfig {
       start_with_windows: false,
       start_minimized: true,
       show_tray_icon: true,
-      single_instance: true,
     },
     automation: {
       enabled: true,
       notifications_enabled: true,
-      default_restore_behavior: 'previous_plan',
-      conflict_strategy: 'highest_priority',
-      respect_manual_plan_changes: false,
       default_close_delay_seconds: 30,
     },
     ui: {
-      theme: 'dark',
-      language: 'es',
       close_button_behavior: 'hide_window',
-      compact_mode: true,
     },
     profiles: [
       {
@@ -76,12 +70,23 @@ describe('configApi', () => {
 
   it('calls Tauri command to save app config', async () => {
     const config = configWithProfiles();
-    const mockInvoke = vi.fn().mockResolvedValue(undefined);
+    const mockInvoke = vi.fn().mockResolvedValue({ warnings: [] });
     const invokeFn = mockInvoke as unknown as InvokeFn;
 
-    await saveAppConfig(invokeFn, config);
+    const result = await saveAppConfig(invokeFn, config);
 
     expect(mockInvoke).toHaveBeenCalledWith('save_app_config', { config });
+    expect(result).toEqual({ warnings: [] });
+  });
+
+  it('consumes a one-time config recovery warning', async () => {
+    const mockInvoke = vi.fn().mockResolvedValue('Configuración recuperada.');
+    const invokeFn = mockInvoke as unknown as InvokeFn;
+
+    const result = await takeConfigRecoveryWarning(invokeFn);
+
+    expect(mockInvoke).toHaveBeenCalledWith('take_config_recovery_warning');
+    expect(result).toBe('Configuración recuperada.');
   });
 
   it('maps persisted profiles to UI games', () => {
@@ -154,6 +159,21 @@ describe('configApi', () => {
       ['chrome', 30],
       ['node', 90],
     ]);
+  });
+
+  it('preserves an explicit priority when a custom plan cannot be classified', () => {
+    const config = configWithProfiles();
+    config.profiles[0].power.on_start_plan_id = 'custom-guid';
+    config.profiles[0].power.priority = 42;
+
+    const normalized = normalizeProfilePriorities(config, [
+      { id: 'custom-guid', name: 'Mi plan personalizado' },
+    ]);
+
+    expect(normalized.profiles[0].power.priority).toBe(42);
+    expect(planToLevel('custom-guid', [{ id: 'custom-guid', name: 'Mi plan personalizado' }], 42)).toBe(
+      'balanced',
+    );
   });
 
   it('creates a persisted profile from an executable path', () => {

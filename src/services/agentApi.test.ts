@@ -11,7 +11,6 @@ import {
   getAgentState,
   installAgentTask,
   isAgentStateStale,
-  shouldAutoInstallElevatedAgent,
   startAgentTask,
   wakeAgent,
 } from './agentApi';
@@ -293,13 +292,6 @@ describe('agentApi', () => {
 
     expect(describeAgentState(state, true, 200)).toContain('WMI degradados');
     expect(agentStateTone(state, true, 200)).toBe('warning');
-  });
-
-  it('only auto-installs the elevated agent inside Tauri when agent automation is enabled and task is missing', () => {
-    expect(shouldAutoInstallElevatedAgent(true, false, true)).toBe(false);
-    expect(shouldAutoInstallElevatedAgent(false, false, true)).toBe(false);
-    expect(shouldAutoInstallElevatedAgent(true, true, true)).toBe(false);
-    expect(shouldAutoInstallElevatedAgent(true, false, false)).toBe(false);
   });
 
   it('creates a stable signature for unchanged agent snapshots', () => {

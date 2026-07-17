@@ -2,6 +2,12 @@
 name = "powershift-agent"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[build-dependencies]
+embed-resource = "3.0.9"
 
 [dependencies]
 powershift-core = { path = "../powershift-core" }

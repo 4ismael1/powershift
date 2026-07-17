@@ -1,4 +1,5 @@
 pub mod autostart;
+pub mod elevation;
 pub mod error;
 #[cfg(feature = "icons")]
 pub mod icon;
@@ -10,9 +11,9 @@ pub mod powercfg;
 pub mod process;
 pub mod process_events;
 pub mod runtime_paths;
+pub mod scheduled_task;
 pub mod single_instance;
 pub mod wake;
-pub mod window_events;
 
 #[cfg(windows)]
 pub mod native;
@@ -21,6 +22,7 @@ pub use autostart::{
     autostart_value_for, autostart_value_with_args, set_autostart, set_autostart_for_executable,
     TRAY_AUTOSTART_VALUE_NAME,
 };
+pub use elevation::run_elevated_and_wait;
 pub use error::{PowerError, PowerResult};
 #[cfg(feature = "icons")]
 pub use icon::{png_data_url, png_data_url_from_executable};
@@ -46,6 +48,7 @@ pub use process_events::{
     ProcessWatcherKind,
 };
 pub use runtime_paths::PowerShiftPaths;
+pub use scheduled_task::set_agent_startup_trigger_enabled;
 pub use single_instance::{
     try_acquire_single_instance, SingleInstanceGuard, AGENT_INSTANCE_MUTEX_NAME,
     TRAY_INSTANCE_MUTEX_NAME, UI_INSTANCE_MUTEX_NAME,
@@ -53,4 +56,3 @@ pub use single_instance::{
 pub use wake::{
     create_agent_wake_event, signal_agent_wake, wait_for_agent_wake, AGENT_WAKE_EVENT_NAME,
 };
-pub use window_events::spawn_window_activity_watcher;

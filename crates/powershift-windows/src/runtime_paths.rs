@@ -38,6 +38,10 @@ impl PowerShiftPaths {
         self.runtime_dir().join("agent-control.token")
     }
 
+    pub fn power_control_lease(&self) -> PathBuf {
+        self.runtime_dir().join("power-control-lease.json")
+    }
+
     pub fn prepare_runtime_directory(&self) -> PowerResult<()> {
         prepare_runtime_directory(self.runtime_dir())
     }
@@ -197,6 +201,12 @@ mod tests {
         assert_eq!(
             paths.events,
             PathBuf::from(r"C:\ProgramData\PowerShift\users\S-1-5-21-1000\events.jsonl")
+        );
+        assert_eq!(
+            paths.power_control_lease(),
+            PathBuf::from(
+                r"C:\ProgramData\PowerShift\users\S-1-5-21-1000\power-control-lease.json"
+            )
         );
     }
 

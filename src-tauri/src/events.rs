@@ -1,5 +1,5 @@
 use powershift_agent::AgentPaths;
-use serde::{Deserialize, Serialize};
+use powershift_agent::EventLogEntry;
 use std::{
     collections::VecDeque,
     fs::File,
@@ -8,47 +8,7 @@ use std::{
 };
 
 #[cfg(test)]
-use std::{
-    fs::OpenOptions,
-    io::Write,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EventLogEntry {
-    pub timestamp_ms: u64,
-    pub level: String,
-    pub kind: String,
-    pub message: String,
-    pub profile_name: Option<String>,
-    pub plan_id: Option<String>,
-}
-
-impl EventLogEntry {
-    #[cfg(test)]
-    pub fn info(kind: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            timestamp_ms: now_ms(),
-            level: "info".to_string(),
-            kind: kind.into(),
-            message: message.into(),
-            profile_name: None,
-            plan_id: None,
-        }
-    }
-
-    #[cfg(test)]
-    pub fn error(kind: impl Into<String>, message: impl Into<String>) -> Self {
-        Self {
-            timestamp_ms: now_ms(),
-            level: "error".to_string(),
-            kind: kind.into(),
-            message: message.into(),
-            profile_name: None,
-            plan_id: None,
-        }
-    }
-}
+use std::{fs::OpenOptions, io::Write};
 
 pub fn event_log_path() -> Result<PathBuf, String> {
     AgentPaths::from_environment()
@@ -137,14 +97,6 @@ pub fn get_recent_events(limit: Option<usize>) -> Result<Vec<EventLogEntry>, Str
 #[tauri::command(rename_all = "snake_case")]
 pub fn clear_events() -> Result<(), String> {
     clear_event_history()
-}
-
-#[cfg(test)]
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
 }
 
 fn should_hide_legacy_event(event: &EventLogEntry) -> bool {

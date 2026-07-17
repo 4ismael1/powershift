@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 3;
+pub const CURRENT_CONFIG_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -29,7 +29,6 @@ pub struct AgentSettings {
     pub start_with_windows: bool,
     pub start_minimized: bool,
     pub show_tray_icon: bool,
-    pub single_instance: bool,
 }
 
 impl Default for AgentSettings {
@@ -39,7 +38,6 @@ impl Default for AgentSettings {
             start_with_windows: true,
             start_minimized: true,
             show_tray_icon: true,
-            single_instance: true,
         }
     }
 }
@@ -49,9 +47,6 @@ pub struct AutomationSettings {
     pub enabled: bool,
     #[serde(default = "default_true")]
     pub notifications_enabled: bool,
-    pub default_restore_behavior: RestoreBehavior,
-    pub conflict_strategy: ConflictStrategy,
-    pub respect_manual_plan_changes: bool,
     pub default_close_delay_seconds: u32,
 }
 
@@ -60,9 +55,6 @@ impl Default for AutomationSettings {
         Self {
             enabled: true,
             notifications_enabled: true,
-            default_restore_behavior: RestoreBehavior::PreviousPlan,
-            conflict_strategy: ConflictStrategy::HighestPriority,
-            respect_manual_plan_changes: false,
             default_close_delay_seconds: 30,
         }
     }
@@ -74,19 +66,13 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UiSettings {
-    pub theme: ThemePreference,
-    pub language: String,
     pub close_button_behavior: CloseButtonBehavior,
-    pub compact_mode: bool,
 }
 
 impl Default for UiSettings {
     fn default() -> Self {
         Self {
-            theme: ThemePreference::Dark,
-            language: "es".to_string(),
             close_button_behavior: CloseButtonBehavior::HideWindow,
-            compact_mode: true,
         }
     }
 }
@@ -292,21 +278,6 @@ pub enum RestoreBehavior {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ConflictStrategy {
-    HighestPriority,
-    LastActivated,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThemePreference {
-    Dark,
-    Light,
-    System,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum CloseButtonBehavior {
     HideWindow,
     ExitApp,
@@ -373,7 +344,10 @@ mod tests {
         assert!(config.automation.enabled);
         assert!(config.automation.notifications_enabled);
         assert!(config.profiles.is_empty());
-        assert_eq!(config.ui.language, "es");
+        assert_eq!(
+            config.ui.close_button_behavior,
+            CloseButtonBehavior::HideWindow
+        );
     }
 
     #[test]

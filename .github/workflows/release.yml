@@ -1,0 +1,190 @@
+name: Signed Windows release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: powershift-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Verify, sign, and publish
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22.23.1'
+          cache: npm
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt,clippy --no-self-update
+          rustup show active-toolchain
+
+      - name: Install JavaScript dependencies
+        run: npm ci
+
+      - name: Verify release version and tag
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\verify-version.ps1 -Tag '${{ github.ref_name }}'
+
+      - name: Run release gates
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          npm test
+          npm audit --audit-level=high
+
+      - name: Audit Rust dependencies
+        shell: pwsh
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo audit -D warnings
+
+      - name: Require signing secrets
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          foreach ($name in 'WINDOWS_CERTIFICATE_BASE64', 'WINDOWS_CERTIFICATE_PASSWORD', 'WINDOWS_TIMESTAMP_URL') {
+            if ([string]::IsNullOrWhiteSpace((Get-Item "env:$name").Value)) {
+              throw "Required release secret $name is not configured."
+            }
+          }
+
+      - name: Import Windows code-signing certificate
+        id: certificate
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          $certificateDirectory = Join-Path $env:RUNNER_TEMP 'powershift-certificate'
+          New-Item -ItemType Directory -Path $certificateDirectory -Force | Out-Null
+          $pfxPath = Join-Path $certificateDirectory 'codesign.pfx'
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_BASE64))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificate = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if (-not $certificate.HasPrivateKey) { throw 'The imported certificate has no private key.' }
+          "thumbprint=$($certificate.Thumbprint)" >> $env:GITHUB_OUTPUT
+          "pfx_path=$pfxPath" >> $env:GITHUB_OUTPUT
+
+      - name: Build and sign native background executables
+        shell: pwsh
+        env:
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+          CERTIFICATE_THUMBPRINT: ${{ steps.certificate.outputs.thumbprint }}
+        run: |
+          npm run build:agent:release
+          npm run build:tray:release
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe was not found.' }
+          foreach ($binary in 'target\release\powershift-agent.exe', 'target\release\powershift-tray.exe') {
+            & $signtool.FullName sign /sha1 $env:CERTIFICATE_THUMBPRINT /fd SHA256 /tr $env:WINDOWS_TIMESTAMP_URL /td SHA256 $binary
+            if ($LASTEXITCODE -ne 0) { throw "Signing failed for $binary." }
+          }
+
+      - name: Build signed application and installer
+        shell: pwsh
+        env:
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+          CERTIFICATE_THUMBPRINT: ${{ steps.certificate.outputs.thumbprint }}
+        run: |
+          $overlay = @{
+            build = @{ beforeBuildCommand = 'npm run build:frontend' }
+            bundle = @{ windows = @{
+              certificateThumbprint = $env:CERTIFICATE_THUMBPRINT
+              digestAlgorithm = 'sha256'
+              timestampUrl = $env:WINDOWS_TIMESTAMP_URL
+              tsp = $true
+            }}
+          } | ConvertTo-Json -Depth 6
+          $overlayPath = Join-Path $env:RUNNER_TEMP 'powershift-release.conf.json'
+          Set-Content -LiteralPath $overlayPath -Value $overlay -Encoding UTF8
+          npm run tauri -- build --ci --config $overlayPath
+
+      - name: Verify Authenticode signatures
+        shell: pwsh
+        run: |
+          $files = @(
+            'target\release\powershift.exe',
+            'target\release\powershift-agent.exe',
+            'target\release\powershift-tray.exe'
+          ) + @(Get-ChildItem 'target\release\bundle\nsis\*.exe' | ForEach-Object FullName)
+          foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature -FilePath $file
+            if ($signature.Status -ne 'Valid') {
+              throw "Invalid Authenticode signature for $file: $($signature.StatusMessage)"
+            }
+          }
+
+      - name: Prepare release assets
+        id: assets
+        shell: pwsh
+        run: |
+          $releaseVersion = '${{ github.ref_name }}'.TrimStart('v')
+          $directory = Join-Path $PWD 'release-artifacts'
+          New-Item -ItemType Directory -Path $directory -Force | Out-Null
+          $sources = @(Get-ChildItem 'target\release\bundle\nsis\*.exe')
+          if ($sources.Count -ne 1) { throw "Expected one NSIS installer, found $($sources.Count)." }
+          $source = $sources[0]
+          $installer = Join-Path $directory "PowerShift_${releaseVersion}_x64-setup.exe"
+          Copy-Item -LiteralPath $source.FullName -Destination $installer
+          $checksum = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksumPath = "$installer.sha256"
+          Set-Content -LiteralPath $checksumPath -Value "$checksum *$([IO.Path]::GetFileName($installer))" -Encoding ASCII
+          "installer=$installer" >> $env:GITHUB_OUTPUT
+          "checksum=$checksumPath" >> $env:GITHUB_OUTPUT
+
+      - name: Attest release provenance
+        uses: actions/attest@36051bcae73b7c2a8a6945a48cbf80953c6baa35 # v4
+        with:
+          subject-path: |
+            ${{ steps.assets.outputs.installer }}
+            ${{ steps.assets.outputs.checksum }}
+
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $assets = @('${{ steps.assets.outputs.installer }}', '${{ steps.assets.outputs.checksum }}')
+          $prerelease = $tag -match '-'
+          if (gh release view $tag --repo '${{ github.repository }}' 2>$null) {
+            gh release upload $tag @assets --clobber --repo '${{ github.repository }}'
+          } else {
+            $arguments = @('release', 'create', $tag) + $assets + @('--verify-tag', '--generate-notes', '--title', "PowerShift $tag", '--repo', '${{ github.repository }}')
+            if ($prerelease) { $arguments += '--prerelease' }
+            & gh @arguments
+          }
+
+      - name: Remove imported certificate material
+        if: always()
+        shell: pwsh
+        run: |
+          $thumbprint = '${{ steps.certificate.outputs.thumbprint }}'
+          if ($thumbprint) { Remove-Item "Cert:\CurrentUser\My\$thumbprint" -Force -ErrorAction SilentlyContinue }
+          $pfxPath = '${{ steps.certificate.outputs.pfx_path }}'
+          if ($pfxPath) { Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue }

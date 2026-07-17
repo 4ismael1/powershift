@@ -58,10 +58,6 @@ where
         .any(|arg| matches!(arg.as_ref(), "--minimized" | "--hidden" | "--background"))
 }
 
-pub fn sync_tray_visibility<R: Runtime>(_app: &AppHandle<R>, _visible: bool) -> Result<(), String> {
-    Ok(())
-}
-
 fn start_ui_show_listener<R: Runtime>(app: AppHandle<R>) {
     std::thread::spawn(move || {
         let Ok(handle) =
@@ -117,6 +113,7 @@ pub fn handle_close_button(app: AppHandle) -> Result<(), String> {
 fn run_close_action<R: Runtime>(app: &AppHandle<R>, action: CloseAction) {
     if action == CloseAction::Exit {
         let _ = powershift_windows::signal_ipc_event(powershift_windows::TRAY_QUIT_EVENT_NAME);
+        let _ = crate::agent_control::stop_agent_task();
     }
     app.exit(0);
 }
@@ -185,6 +182,7 @@ mod tests {
         let source = std::fs::read_to_string(source_path).expect("read source");
 
         assert!(source.contains("TRAY_QUIT_EVENT_NAME"));
+        assert!(source.contains("agent_control::stop_agent_task"));
         assert!(source.contains("run_close_action"));
     }
 
@@ -235,6 +233,23 @@ mod tests {
             .expect("window backgroundColor should be a string");
 
         assert_eq!(background, "#090d0d");
+    }
+
+    #[test]
+    fn production_webview_uses_hardened_security_defaults() {
+        let config: Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).expect("tauri config json");
+        let security = &config["app"]["security"];
+
+        assert_eq!(security["freezePrototype"].as_bool(), Some(true));
+        assert_eq!(security["csp"]["style-src"].as_str(), Some("'self'"));
+        assert!(security["devCsp"]["style-src"]
+            .as_str()
+            .is_some_and(|value| value.contains("'unsafe-inline'")));
+        assert_eq!(
+            config["build"]["removeUnusedCommands"].as_bool(),
+            Some(true)
+        );
     }
 
     #[test]

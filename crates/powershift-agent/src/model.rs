@@ -7,6 +7,8 @@ pub struct AgentScanResult {
     pub matched_profile_name: Option<String>,
     pub target_plan_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_profile_name: Option<String>,
     #[serde(default)]
     pub active_profiles: Vec<AgentActiveProfile>,

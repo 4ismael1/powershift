@@ -13,23 +13,16 @@ export interface AgentSettings {
   start_with_windows: boolean;
   start_minimized: boolean;
   show_tray_icon: boolean;
-  single_instance: boolean;
 }
 
 export interface AutomationSettings {
   enabled: boolean;
   notifications_enabled: boolean;
-  default_restore_behavior: string;
-  conflict_strategy: string;
-  respect_manual_plan_changes: boolean;
   default_close_delay_seconds: number;
 }
 
 export interface UiSettings {
-  theme: string;
-  language: string;
   close_button_behavior: string;
-  compact_mode: boolean;
 }
 
 export interface ProfileConfig {
@@ -110,12 +103,23 @@ export interface AppSettingsUpdate {
   notificationsEnabled?: boolean;
 }
 
+export interface ConfigSaveOutcome {
+  warnings: string[];
+}
+
 export async function getAppConfig(invokeFn: InvokeFn): Promise<AppConfig> {
   return invokeFn<AppConfig>('get_app_config');
 }
 
-export async function saveAppConfig(invokeFn: InvokeFn, config: AppConfig): Promise<void> {
-  return invokeFn<void>('save_app_config', { config });
+export async function takeConfigRecoveryWarning(invokeFn: InvokeFn): Promise<string | null> {
+  return invokeFn<string | null>('take_config_recovery_warning');
+}
+
+export async function saveAppConfig(
+  invokeFn: InvokeFn,
+  config: AppConfig,
+): Promise<ConfigSaveOutcome> {
+  return invokeFn<ConfigSaveOutcome>('save_app_config', { config });
 }
 
 export function profilesToUiGames(config: AppConfig, powerPlans: PowerPlan[] = []): UiGameProfile[] {
@@ -148,7 +152,11 @@ export function normalizeProfilePriorities(config: AppConfig, powerPlans: PowerP
   return {
     ...config,
     profiles: config.profiles.map((profile) => {
-      const priority = priorityForPlan(profile.power.on_start_plan_id, powerPlans);
+      const priority = priorityForPlan(
+        profile.power.on_start_plan_id,
+        powerPlans,
+        profile.power.priority,
+      );
       if (profile.power.priority === priority) return profile;
 
       return {
@@ -209,7 +217,7 @@ export function updateProfileConfig(
           on_start_plan_id: nextStartPlan,
           priority:
             update.startPlan && update.startPlan !== profile.power.on_start_plan_id
-              ? priorityForPlan(nextStartPlan, powerPlans)
+              ? priorityForPlan(nextStartPlan, powerPlans, profile.power.priority)
               : profile.power.priority,
           close_delay_seconds: update.closeDelay ? closeDelaySeconds(update.closeDelay) : profile.power.close_delay_seconds,
         },
@@ -371,9 +379,13 @@ export function createProfileFromExecutable(executablePath: string, options: Cre
 }
 
 export function planToLevel(planId: string, powerPlans: PowerPlan[] = [], fallbackPriority = 70): UiGameProfile['level'] {
+  return inferredLevelForPlan(planId, powerPlans) ?? priorityToLevel(fallbackPriority);
+}
+
+function inferredLevelForPlan(planId: string, powerPlans: PowerPlan[]): UiGameProfile['level'] | null {
   const plan = powerPlans.find((item) => item.id === planId);
   const value = normalizePlanText(`${planId} ${plan?.name ?? ''}`);
-  if (value.includes('ultimate') || value.includes('max') || value.includes('máximo') || value.includes('maximo')) {
+  if (value.includes('ultimate') || value.includes('max') || value.includes('maximo')) {
     return 'max';
   }
   if (value.includes('high') || value.includes('alto') || value.includes('performance') || value.includes('rendimiento')) {
@@ -382,7 +394,7 @@ export function planToLevel(planId: string, powerPlans: PowerPlan[] = [], fallba
   if (value.includes('balanced') || value.includes('equilibrado') || value.includes('balanceado') || value.includes('power saver')) {
     return 'balanced';
   }
-  return priorityToLevel(fallbackPriority);
+  return null;
 }
 
 function normalizePlanText(value: string): string {
@@ -398,8 +410,9 @@ function priorityToLevel(priority: number): UiGameProfile['level'] {
   return 'balanced';
 }
 
-function priorityForPlan(planId: string, powerPlans: PowerPlan[] = []): number {
-  const level = planToLevel(planId, powerPlans, 70);
+function priorityForPlan(planId: string, powerPlans: PowerPlan[] = [], fallbackPriority = 70): number {
+  const level = inferredLevelForPlan(planId, powerPlans);
+  if (!level) return fallbackPriority;
   if (level === 'max') return 90;
   if (level === 'high') return 70;
   return 30;

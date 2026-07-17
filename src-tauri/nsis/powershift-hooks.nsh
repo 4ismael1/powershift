@@ -39,6 +39,21 @@ Function PowerShiftReadExistingConfigFlags
   powershift_config_done:
 FunctionEnd
 
+!macro NSIS_HOOK_PREINSTALL
+  ; An in-place update must release executable locks and return Windows to the
+  ; pre-PowerShift plan before NSIS replaces the installed binaries.
+  ${If} ${FileExists} "$INSTDIR\powershift-tray.exe"
+    ExecWait '"$INSTDIR\powershift-tray.exe" --quit'
+  ${EndIf}
+  ${If} ${FileExists} "$INSTDIR\powershift-agent.exe"
+    ExecWait '"$INSTDIR\powershift-agent.exe" --shutdown-ipc'
+    Sleep 1200
+    ExecWait '"$INSTDIR\powershift-agent.exe" --release-power-control'
+  ${EndIf}
+  nsExec::ExecToLog `powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "Get-ScheduledTask -TaskName 'PowerShiftAgent-*' -ErrorAction SilentlyContinue | Stop-ScheduledTask -ErrorAction SilentlyContinue"`
+  Pop $0
+!macroend
+
 !macro NSIS_HOOK_POSTINSTALL
   ; PowerShift installs the elevated agent as a tiny background task.
   ; The tray remains a normal user process so opening the UI never requires elevation.
@@ -87,6 +102,14 @@ FunctionEnd
   ${If} ${FileExists} "$INSTDIR\powershift-tray.exe"
     ExecWait '"$INSTDIR\powershift-tray.exe" --quit'
     Sleep 1200
+  ${EndIf}
+
+  ; Restore the plan before removing the elevated task. The fallback is
+  ; idempotent and also covers an unresponsive agent process.
+  ${If} ${FileExists} "$INSTDIR\powershift-agent.exe"
+    ExecWait '"$INSTDIR\powershift-agent.exe" --shutdown-ipc'
+    Sleep 1200
+    ExecWait '"$INSTDIR\powershift-agent.exe" --release-power-control'
   ${EndIf}
 
   nsExec::ExecToLog `powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -Command "$$tasks = @(Get-ScheduledTask -TaskName 'PowerShiftAgent-*' -ErrorAction SilentlyContinue); $$legacy = Get-ScheduledTask -TaskName 'PowerShiftAgent' -ErrorAction SilentlyContinue; if ($$legacy) { $$tasks += $$legacy }; foreach ($$task in $$tasks) { Stop-ScheduledTask -TaskName $$task.TaskName -ErrorAction SilentlyContinue; Unregister-ScheduledTask -TaskName $$task.TaskName -Confirm:$$false -ErrorAction SilentlyContinue }"`

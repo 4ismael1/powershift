@@ -11,21 +11,14 @@ function emptyConfig(): AppConfig {
       start_with_windows: false,
       start_minimized: true,
       show_tray_icon: true,
-      single_instance: true,
     },
     automation: {
       enabled: true,
       notifications_enabled: true,
-      default_restore_behavior: 'previous_plan',
-      conflict_strategy: 'highest_priority',
-      respect_manual_plan_changes: false,
       default_close_delay_seconds: 30,
     },
     ui: {
-      theme: 'dark',
-      language: 'es',
       close_button_behavior: 'hide_window',
-      compact_mode: true,
     },
     profiles: [],
   };
@@ -85,5 +78,15 @@ describe('autoDetect', () => {
     ]);
 
     expect(candidates.map((candidate) => candidate.executableName)).toEqual(['game.exe', 'tool.exe']);
+  });
+
+  it('never proposes PowerShift background components as profiles', () => {
+    const candidates = detectProfileCandidates(emptyConfig(), [
+      { pid: 50, name: 'powershift.exe', path: 'C:\\Program Files\\PowerShift\\powershift.exe' },
+      { pid: 51, name: 'powershift-agent.exe', path: 'C:\\Program Files\\PowerShift\\powershift-agent.exe' },
+      { pid: 52, name: 'powershift-tray.exe', path: 'C:\\Program Files\\PowerShift\\powershift-tray.exe' },
+    ]);
+
+    expect(candidates).toEqual([]);
   });
 });

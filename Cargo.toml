@@ -10,10 +10,16 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "0.2.0"
+version = "1.0.0"
+authors = ["4ismael1"]
+license = "GPL-3.0-only"
+repository = "https://github.com/4ismael1/powershift"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 windows = "0.61.3"
 windows-core = "=0.61.2"
+
+[profile.test]
+debug = 0

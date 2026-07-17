@@ -1,8 +1,10 @@
+include!("../../build/windows_resources.rs");
+
 fn main() {
     #[cfg(windows)]
-    {
-        embed_resource::compile("resources/powershift-tray.rc", embed_resource::NONE)
-            .manifest_optional()
-            .expect("embed tray resources");
-    }
+    compile_windows_resources(
+        "PowerShift",
+        "PowerShift notification area companion",
+        "powershift-tray.exe",
+    );
 }

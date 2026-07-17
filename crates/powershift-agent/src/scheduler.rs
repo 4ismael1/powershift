@@ -94,6 +94,7 @@ impl AgentWatchSet {
 pub(crate) struct AgentScanScheduler {
     pending: Option<PendingScheduledScan>,
     last_public_wake_ms: Option<u64>,
+    degraded_scan_due_at_ms: Option<u64>,
 }
 
 /// A bounded retry queue for a WMI start event whose process handle is not
@@ -211,20 +212,40 @@ impl AgentScanScheduler {
         true
     }
 
+    pub(crate) fn synchronize_degraded_mode(&mut self, degraded: bool, now_ms: u64) {
+        if degraded {
+            self.degraded_scan_due_at_ms.get_or_insert(now_ms);
+        } else {
+            self.degraded_scan_due_at_ms = None;
+        }
+    }
+
     pub(crate) fn due(&self, now_ms: u64) -> bool {
-        self.pending
+        let scheduled_scan_due = self
+            .pending
             .as_ref()
-            .is_some_and(|pending| pending.force || pending.due_at_ms <= now_ms)
+            .is_some_and(|pending| pending.force || pending.due_at_ms <= now_ms);
+        let degraded_scan_due = self
+            .degraded_scan_due_at_ms
+            .is_some_and(|due_at_ms| due_at_ms <= now_ms);
+        scheduled_scan_due || degraded_scan_due
     }
 
     pub(crate) fn next_wait(&self, now_ms: u64) -> Option<Duration> {
-        self.pending
+        let scheduled_wait = self
+            .pending
             .as_ref()
-            .map(|pending| Duration::from_millis(pending.due_at_ms.saturating_sub(now_ms)))
+            .map(|pending| Duration::from_millis(pending.due_at_ms.saturating_sub(now_ms)));
+        let degraded_wait = self
+            .degraded_scan_due_at_ms
+            .map(|due_at_ms| Duration::from_millis(due_at_ms.saturating_sub(now_ms)));
+        minimum_wait(scheduled_wait, degraded_wait)
     }
 
-    pub(crate) fn mark_scan_completed(&mut self, _now_ms: u64) {
+    pub(crate) fn mark_scan_completed(&mut self, now_ms: u64, degraded: bool) {
         self.pending = None;
+        self.degraded_scan_due_at_ms = degraded
+            .then(|| now_ms.saturating_add(DEGRADED_PROCESS_SCAN_INTERVAL.as_millis() as u64));
     }
 
     fn public_wake_on_cooldown(&self, now_ms: u64) -> bool {
@@ -237,20 +258,10 @@ impl AgentScanScheduler {
 pub(crate) fn next_wait_with_scheduler(
     state: &AgentRuntimeState,
     scheduler: &AgentScanScheduler,
-    watcher_health_degraded: bool,
 ) -> Option<Duration> {
     let now = now_ms();
     let restore_wait = next_restore_wait_at(state, now);
-    let base = if watcher_health_degraded {
-        Some(
-            restore_wait
-                .unwrap_or(DEGRADED_PROCESS_SCAN_INTERVAL)
-                .min(DEGRADED_PROCESS_SCAN_INTERVAL),
-        )
-    } else {
-        restore_wait
-    };
-    minimum_wait(base, scheduler.next_wait(now))
+    minimum_wait(restore_wait, scheduler.next_wait(now))
 }
 
 pub(crate) fn minimum_wait(left: Option<Duration>, right: Option<Duration>) -> Option<Duration> {
@@ -401,5 +412,22 @@ mod tests {
             minimum_wait(Some(Duration::from_secs(5)), Some(Duration::from_secs(2))),
             Some(Duration::from_secs(2))
         );
+    }
+
+    #[test]
+    fn degraded_scan_deadline_is_absolute_and_does_not_slide_with_activity() {
+        let mut scheduler = AgentScanScheduler::default();
+        scheduler.synchronize_degraded_mode(true, 1_000);
+        scheduler.mark_scan_completed(1_000, true);
+
+        assert_eq!(
+            scheduler.next_wait(2_000),
+            Some(DEGRADED_PROCESS_SCAN_INTERVAL - Duration::from_secs(1))
+        );
+        assert_eq!(scheduler.next_wait(20_000), Some(Duration::from_secs(11)));
+        assert!(scheduler.due(31_000));
+
+        scheduler.synchronize_degraded_mode(false, 31_000);
+        assert_eq!(scheduler.next_wait(31_000), None);
     }
 }

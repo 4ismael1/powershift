@@ -21,6 +21,7 @@ fn main() {
         }
         AgentCliMode::ReevaluateIpc => powershift_agent::request_agent_reevaluate_via_ipc(),
         AgentCliMode::ShutdownIpc => powershift_agent::request_agent_shutdown_via_ipc(),
+        AgentCliMode::ReleasePowerControl => powershift_agent::release_power_control_once(),
         AgentCliMode::Signal => {
             powershift_windows::signal_agent_wake().map_err(|error| error.to_string())
         }
@@ -52,6 +53,7 @@ enum AgentCliMode {
     StatusIpc,
     ReevaluateIpc,
     ShutdownIpc,
+    ReleasePowerControl,
     Signal,
     Run,
 }
@@ -65,6 +67,8 @@ fn agent_cli_mode(args: &[String]) -> AgentCliMode {
         AgentCliMode::ReevaluateIpc
     } else if args.iter().any(|arg| arg == "--shutdown-ipc") {
         AgentCliMode::ShutdownIpc
+    } else if args.iter().any(|arg| arg == "--release-power-control") {
+        AgentCliMode::ReleasePowerControl
     } else if args.iter().any(|arg| arg == "--signal") {
         AgentCliMode::Signal
     } else {
@@ -93,6 +97,10 @@ mod tests {
         assert_eq!(
             agent_cli_mode(&args("--shutdown-ipc")),
             AgentCliMode::ShutdownIpc
+        );
+        assert_eq!(
+            agent_cli_mode(&args("--release-power-control")),
+            AgentCliMode::ReleasePowerControl
         );
     }
 

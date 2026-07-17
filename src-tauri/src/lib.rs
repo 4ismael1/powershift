@@ -7,6 +7,12 @@ mod processes;
 mod shell;
 mod windowing;
 
+pub fn repair_agent_task_elevated_cli() -> Result<(), String> {
+    agent_control::repair_agent_task_elevated_cli()
+}
+
+pub use agent_control::REPAIR_AGENT_TASK_FLAG;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let ui_instance = match powershift_windows::try_acquire_single_instance(
@@ -42,6 +48,7 @@ pub fn run() {
             agent_control::wake_agent,
             config::get_app_config,
             config::save_app_config,
+            config::take_config_recovery_warning,
             events::clear_events,
             events::get_recent_events,
             icons::get_executable_icon,

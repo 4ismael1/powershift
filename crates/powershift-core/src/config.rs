@@ -258,6 +258,19 @@ mod tests {
 
         assert_eq!(migrated.version, CURRENT_CONFIG_VERSION);
         assert!(migrated.automation.notifications_enabled);
+
+        let persisted = ConfigStore::to_pretty_json(&migrated).expect("serialize migrated config");
+        for obsolete_key in [
+            "single_instance",
+            "default_restore_behavior",
+            "conflict_strategy",
+            "respect_manual_plan_changes",
+            "theme",
+            "language",
+            "compact_mode",
+        ] {
+            assert!(!persisted.contains(obsolete_key));
+        }
     }
 
     #[test]

@@ -1,4 +1,7 @@
 import { describe, expect, it } from 'vitest';
+import agentBuildScript from '../crates/powershift-agent/build.rs?raw';
+import agentManifest from '../crates/powershift-agent/Cargo.toml?raw';
+import trayBuildScript from '../crates/powershift-tray/build.rs?raw';
 import installerHooks from '../src-tauri/nsis/powershift-hooks.nsh?raw';
 import tauriConfigRaw from '../src-tauri/tauri.conf.json?raw';
 
@@ -21,13 +24,27 @@ describe('installer background architecture', () => {
     expect(tauriConfig.bundle.windows.nsis).toMatchObject({
       installMode: 'perMachine',
       installerHooks: 'nsis/powershift-hooks.nsh',
+      languages: ['Spanish'],
     });
   });
 
+  it('ships stable publisher and version metadata in every executable', () => {
+    expect(tauriConfig.version).toBe('1.0.0');
+    expect(tauriConfig.bundle.publisher).toBe('4ismael1');
+    expect(tauriConfig.bundle.copyright).toContain('4ismael1');
+    expect(agentManifest).toContain('embed-resource = "3.0.9"');
+    expect(agentBuildScript).toContain('PowerShift background agent');
+    expect(agentBuildScript).toContain('powershift-agent.exe');
+    expect(trayBuildScript).toContain('PowerShift notification area companion');
+    expect(trayBuildScript).toContain('powershift-tray.exe');
+  });
+
   it('syncs background components on install and cleans them on uninstall', () => {
+    const preInstall = macroBody('NSIS_HOOK_PREINSTALL');
     const postInstall = macroBody('NSIS_HOOK_POSTINSTALL');
     const preUninstall = macroBody('NSIS_HOOK_PREUNINSTALL');
 
+    expect(installerHooks).toContain('NSIS_HOOK_PREINSTALL');
     expect(installerHooks).toContain('NSIS_HOOK_POSTINSTALL');
     expect(installerHooks).toContain('NSIS_HOOK_PREUNINSTALL');
     expect(installerHooks).toContain('PowerShiftReadExistingConfigFlags');
@@ -54,6 +71,12 @@ describe('installer background architecture', () => {
     expect(postInstall).toContain('Unregister-ScheduledTask -TaskName PowerShiftAgent');
     expect(postInstall).not.toContain('schtasks /End');
     expect(postInstall).not.toContain('schtasks /Delete');
+    expect(preInstall).toContain('powershift-tray.exe" --quit');
+    expect(preInstall).toContain('powershift-agent.exe" --shutdown-ipc');
+    expect(preInstall).toContain('powershift-agent.exe" --release-power-control');
+    expect(preInstall).toContain("Get-ScheduledTask -TaskName 'PowerShiftAgent-*'");
+    expect(preInstall).toContain('Stop-ScheduledTask');
+    expect(preInstall).not.toContain('Unregister-ScheduledTask');
     expect(installerHooks).toContain('powershift-agent.exe');
     expect(installerHooks).toContain('PowerShiftTray');
     expect(installerHooks).toContain('powershift-tray.exe');

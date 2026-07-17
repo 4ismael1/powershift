@@ -2,6 +2,9 @@
 name = "powershift-tray"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [dependencies]
 powershift-windows = { path = "../powershift-windows" }

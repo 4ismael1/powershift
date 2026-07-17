@@ -1,13 +1,14 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PowerShift",
-  "version": "0.2.0",
+  "version": "1.0.0",
   "identifier": "com.powershift.desktop",
   "build": {
     "beforeDevCommand": "npm run tauri:before-dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run tauri:before-build",
-    "frontendDist": "../dist"
+    "frontendDist": "../dist",
+    "removeUnusedCommands": true
   },
   "app": {
     "windows": [
@@ -25,15 +26,25 @@
       }
     ],
     "security": {
+      "freezePrototype": true,
       "csp": {
         "default-src": "'self' customprotocol: asset:",
         "img-src": "'self' asset: http://asset.localhost blob: data:",
-        "style-src": "'unsafe-inline' 'self'"
+        "style-src": "'self'"
+      },
+      "devCsp": {
+        "default-src": "'self' http://localhost:1420",
+        "connect-src": "'self' ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1420",
+        "img-src": "'self' asset: http://asset.localhost blob: data:",
+        "script-src": "'self' 'unsafe-eval' http://localhost:1420",
+        "style-src": "'self' 'unsafe-inline' http://localhost:1420"
       }
     }
   },
   "bundle": {
     "active": true,
+    "publisher": "4ismael1",
+    "copyright": "Copyright (c) 2026 4ismael1",
     "targets": ["nsis"],
     "icon": [
       "icons/32x32.png",
@@ -49,7 +60,8 @@
     "windows": {
       "nsis": {
         "installMode": "perMachine",
-        "installerHooks": "nsis/powershift-hooks.nsh"
+        "installerHooks": "nsis/powershift-hooks.nsh",
+        "languages": ["Spanish"]
       }
     }
   }

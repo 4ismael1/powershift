@@ -3,6 +3,7 @@ mod engine;
 mod ipc;
 mod model;
 mod paths;
+mod power_lease;
 mod process_registry;
 mod process_runtime;
 mod publisher;
@@ -11,8 +12,8 @@ mod scheduler;
 pub use engine::evaluate_agent_scan_stateful;
 pub use ipc::{
     request_agent_clear_events_via_ipc, request_agent_reevaluate_via_ipc,
-    request_agent_shutdown_via_ipc, request_agent_status_via_ipc, AgentIpcRequest,
-    AgentIpcResponse,
+    request_agent_set_startup_via_ipc, request_agent_shutdown_via_ipc,
+    request_agent_status_via_ipc, AgentIpcRequest, AgentIpcResponse,
 };
 pub use model::{
     AgentActiveProfile, AgentRuntimeState, AgentScanResult, PendingRestoreState,
@@ -22,10 +23,13 @@ pub use model::{
 pub use paths::AgentPaths;
 pub use publisher::{append_event_to_path, publish_state, EventLogEntry};
 
+#[cfg(test)]
 use engine::evaluate_agent_processes_stateful;
+use engine::evaluate_agent_processes_with_journal;
 #[cfg(test)]
 use ipc::handle_agent_ipc_request;
 use ipc::{load_or_create_control_token, spawn_agent_ipc_server, AgentSharedState};
+use power_lease::{recover_power_control_lease, release_power_control, PowerLeaseStore};
 use powershift_windows::{
     create_agent_wake_event, inspect_process, spawn_process_event_watchers, wait_for_agent_wake,
     PowerManager, PowerManagerBackend, ProcessSnapshotBackend, ProcessWatchMessage,
@@ -43,8 +47,6 @@ use publisher::{
     publish_error_with_shared, publish_scan_outcome_with_shared, write_scan_event,
     AgentPublishMemory,
 };
-#[cfg(test)]
-use scheduler::DEGRADED_PROCESS_SCAN_INTERVAL;
 use scheduler::{
     agent_wake_event, is_agent_wake_event, minimum_wait, next_wait_with_scheduler,
     AgentScanScheduler, AgentWatchSet, TargetedInspectionQueue,
@@ -113,6 +115,8 @@ pub fn run_agent_forever() -> Result<(), String> {
     let process_backend = SystemProcessBackend;
     let power_backend = PowerManager::new();
     let control_token = load_or_create_control_token(&paths.control_token())?;
+    let mut power_lease = PowerLeaseStore::open(paths.power_control_lease())?;
+    let lease_warning = power_lease.take_warning();
 
     let starting_state = PublishedAgentState {
         pid: std::process::id(),
@@ -162,17 +166,23 @@ pub fn run_agent_forever() -> Result<(), String> {
         }
     });
 
-    let mut config = AppConfig::default();
-    let mut watch_set = AgentWatchSet::default();
-    let scan_result = refresh_config_and_reconcile(
-        &paths,
-        &process_backend,
-        &power_backend,
-        &mut runtime,
-        &mut config,
-        &mut watch_set,
-        &mut process_registry,
-    );
+    let (mut config, initial_config_error) = load_agent_config_for_startup(&paths.config);
+    let mut watch_set = AgentWatchSet::from_config(&config);
+    let recovery_result =
+        recover_power_control_lease(&config, &power_backend, &mut runtime, &mut power_lease);
+    let scan_result = recovery_result.and_then(|_| {
+        let result = reconcile_process_registry(
+            &config,
+            &watch_set,
+            &process_backend,
+            &power_backend,
+            &mut runtime,
+            &mut process_registry,
+            &mut power_lease,
+        );
+        write_scan_event(&paths.events, &result, &power_backend);
+        result
+    });
     synchronize_exit_watches(
         &mut exit_watches,
         &process_registry,
@@ -181,15 +191,113 @@ pub fn run_agent_forever() -> Result<(), String> {
         &shared_state,
         &mut publish_memory,
     );
+    if let Some(warning) = lease_warning {
+        let _ = append_event_to_path(
+            paths.events.clone(),
+            &EventLogEntry::error("power_lease_recovery_warning", warning),
+        );
+    }
     publish_scan_outcome_with_shared(
         &paths,
         scan_result,
         &mut publish_memory,
         Some(&shared_state),
     )?;
+    if let Some(error) = initial_config_error {
+        publish_error_with_shared(
+            &paths,
+            &format!("Configuración no disponible; el agente permanece en modo seguro. {error}"),
+            &mut publish_memory,
+            Some(&shared_state),
+        )?;
+    }
     loop {
-        let receive_timeout =
-            next_wait_with_scheduler(&runtime, &scheduler, watcher_health.is_degraded());
+        let now = now_ms();
+        let watcher_degraded = watcher_health.is_degraded();
+        scheduler.synchronize_degraded_mode(watcher_degraded, now);
+
+        let due_inspections = pending_inspections.take_due(now);
+        if !due_inspections.is_empty() {
+            let mut changed = false;
+            for inspection in due_inspections {
+                match inspect_process(inspection.pid, &inspection.name) {
+                    Some(observed) => {
+                        changed |= apply_observed_start(
+                            &config,
+                            &watch_set,
+                            &mut process_registry,
+                            observed,
+                        );
+                    }
+                    None => pending_inspections.reschedule_after_failure(inspection, now),
+                }
+            }
+            synchronize_exit_watches(
+                &mut exit_watches,
+                &process_registry,
+                &pending_inspections,
+                &sender,
+                &shared_state,
+                &mut publish_memory,
+            );
+            if changed {
+                let scan_result = evaluate_registry_with_paths(
+                    &paths,
+                    &power_backend,
+                    &mut runtime,
+                    &config,
+                    &process_registry,
+                    &mut power_lease,
+                );
+                publish_scan_outcome_with_shared(
+                    &paths,
+                    scan_result,
+                    &mut publish_memory,
+                    Some(&shared_state),
+                )?;
+            }
+        }
+
+        if scheduler.due(now) || restore_due_at(&runtime, now) {
+            let reconcile_outcome = refresh_config_and_reconcile(
+                &paths,
+                &process_backend,
+                &power_backend,
+                AgentReconcileContext {
+                    state: &mut runtime,
+                    config: &mut config,
+                    watch_set: &mut watch_set,
+                    registry: &mut process_registry,
+                    power_lease: &mut power_lease,
+                },
+            );
+            exit_watches.clear_unavailable();
+            synchronize_exit_watches(
+                &mut exit_watches,
+                &process_registry,
+                &pending_inspections,
+                &sender,
+                &shared_state,
+                &mut publish_memory,
+            );
+            publish_scan_outcome_with_shared(
+                &paths,
+                reconcile_outcome.scan_result,
+                &mut publish_memory,
+                Some(&shared_state),
+            )?;
+            if let Some(warning) = reconcile_outcome.config_warning {
+                publish_error_with_shared(
+                    &paths,
+                    &warning,
+                    &mut publish_memory,
+                    Some(&shared_state),
+                )?;
+            }
+            scheduler.mark_scan_completed(now_ms(), watcher_degraded);
+        }
+
+        let receive_timeout = next_wait_with_scheduler(&runtime, &scheduler);
         let receive_timeout =
             minimum_wait(receive_timeout, pending_inspections.next_wait(now_ms()));
         match receive_process_message(&receiver, receive_timeout) {
@@ -233,6 +341,7 @@ pub fn run_agent_forever() -> Result<(), String> {
                         &mut runtime,
                         &config,
                         &process_registry,
+                        &mut power_lease,
                     );
                     publish_scan_outcome_with_shared(
                         &paths,
@@ -258,6 +367,7 @@ pub fn run_agent_forever() -> Result<(), String> {
                         &mut runtime,
                         &config,
                         &process_registry,
+                        &mut power_lease,
                     );
                     publish_scan_outcome_with_shared(
                         &paths,
@@ -293,102 +403,18 @@ pub fn run_agent_forever() -> Result<(), String> {
                     Some(&shared_state),
                 )?;
             }
-            Ok(ProcessWatchMessage::Shutdown) => return Ok(()),
-            Err(RecvTimeoutError::Timeout) => {
-                let now = now_ms();
-                let due_inspections = pending_inspections.take_due(now);
-                if !due_inspections.is_empty() {
-                    let mut changed = false;
-                    for inspection in due_inspections {
-                        match inspect_process(inspection.pid, &inspection.name) {
-                            Some(observed) => {
-                                changed |= apply_observed_start(
-                                    &config,
-                                    &watch_set,
-                                    &mut process_registry,
-                                    observed,
-                                );
-                            }
-                            None => pending_inspections.reschedule_after_failure(inspection, now),
-                        }
-                    }
-                    synchronize_exit_watches(
-                        &mut exit_watches,
-                        &process_registry,
-                        &pending_inspections,
-                        &sender,
-                        &shared_state,
-                        &mut publish_memory,
-                    );
-                    if changed {
-                        let scan_result = evaluate_registry_with_paths(
-                            &paths,
-                            &power_backend,
-                            &mut runtime,
-                            &config,
-                            &process_registry,
-                        );
-                        publish_scan_outcome_with_shared(
-                            &paths,
-                            scan_result,
-                            &mut publish_memory,
-                            Some(&shared_state),
-                        )?;
-                    }
-                }
-                if scheduler.due(now) {
-                    let scan_result = refresh_config_and_reconcile(
+            Ok(ProcessWatchMessage::Shutdown) => {
+                if let Err(error) = release_power_control(&power_backend, &mut power_lease) {
+                    publish_error_with_shared(
                         &paths,
-                        &process_backend,
-                        &power_backend,
-                        &mut runtime,
-                        &mut config,
-                        &mut watch_set,
-                        &mut process_registry,
-                    );
-                    exit_watches.clear_unavailable();
-                    synchronize_exit_watches(
-                        &mut exit_watches,
-                        &process_registry,
-                        &pending_inspections,
-                        &sender,
-                        &shared_state,
-                        &mut publish_memory,
-                    );
-                    publish_scan_outcome_with_shared(
-                        &paths,
-                        scan_result,
-                        &mut publish_memory,
-                        Some(&shared_state),
-                    )?;
-                    scheduler.mark_scan_completed(now_ms());
-                } else if restore_due(&runtime) || watcher_health.is_degraded() {
-                    let scan_result = refresh_config_and_reconcile(
-                        &paths,
-                        &process_backend,
-                        &power_backend,
-                        &mut runtime,
-                        &mut config,
-                        &mut watch_set,
-                        &mut process_registry,
-                    );
-                    exit_watches.clear_unavailable();
-                    synchronize_exit_watches(
-                        &mut exit_watches,
-                        &process_registry,
-                        &pending_inspections,
-                        &sender,
-                        &shared_state,
-                        &mut publish_memory,
-                    );
-                    publish_scan_outcome_with_shared(
-                        &paths,
-                        scan_result,
+                        &error,
                         &mut publish_memory,
                         Some(&shared_state),
                     )?;
                 }
+                return Ok(());
             }
+            Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
     }
@@ -406,6 +432,15 @@ pub fn run_scan_once() -> Result<AgentScanResult, String> {
         &PowerManager::new(),
         &mut runtime,
     )
+}
+
+/// Releases a persisted power-control lease without starting the agent loop.
+/// The uninstaller uses this as an idempotent fallback after requesting a
+/// graceful IPC shutdown.
+pub fn release_power_control_once() -> Result<(), String> {
+    let paths = AgentPaths::from_environment().map_err(|error| error.to_string())?;
+    let mut power_lease = PowerLeaseStore::open(paths.power_control_lease())?;
+    release_power_control(&PowerManager::new(), &mut power_lease)
 }
 
 pub fn run_agent_scan_with_paths<P, W>(
@@ -447,78 +482,105 @@ where
     (result, watch_set)
 }
 
+struct AgentReconcileContext<'a> {
+    state: &'a mut AgentRuntimeState,
+    config: &'a mut AppConfig,
+    watch_set: &'a mut AgentWatchSet,
+    registry: &'a mut ProcessRegistry,
+    power_lease: &'a mut PowerLeaseStore,
+}
+
+struct AgentReconcileOutcome {
+    scan_result: Result<AgentScanResult, String>,
+    config_warning: Option<String>,
+}
+
 fn refresh_config_and_reconcile<P, W>(
     paths: &AgentPaths,
     process_backend: &P,
     power_backend: &W,
-    state: &mut AgentRuntimeState,
-    config: &mut AppConfig,
-    watch_set: &mut AgentWatchSet,
-    registry: &mut ProcessRegistry,
-) -> Result<AgentScanResult, String>
+    context: AgentReconcileContext<'_>,
+) -> AgentReconcileOutcome
 where
     P: ProcessSnapshotBackend,
     W: PowerManagerBackend,
 {
-    let next_config = load_agent_config(&paths.config)?;
-    let next_watch_set = AgentWatchSet::from_config(&next_config);
-    *config = next_config;
-    *watch_set = next_watch_set;
+    let config_warning = match load_agent_config(&paths.config) {
+        Ok(next_config) => {
+            let next_watch_set = AgentWatchSet::from_config(&next_config);
+            *context.config = next_config;
+            *context.watch_set = next_watch_set;
+            None
+        }
+        Err(error) => Some(format!(
+            "No se pudo recargar la configuracion; se conserva la ultima version valida. {error}"
+        )),
+    };
     let result = reconcile_process_registry(
-        config,
-        watch_set,
+        context.config,
+        context.watch_set,
         process_backend,
         power_backend,
-        state,
-        registry,
+        context.state,
+        context.registry,
+        context.power_lease,
     );
     write_scan_event(&paths.events, &result, power_backend);
-    result
+    AgentReconcileOutcome {
+        scan_result: result,
+        config_warning,
+    }
 }
 
-fn reconcile_process_registry<P, W>(
+fn reconcile_process_registry<P, W, J>(
     config: &AppConfig,
     watch_set: &AgentWatchSet,
     process_backend: &P,
     power_backend: &W,
     state: &mut AgentRuntimeState,
     registry: &mut ProcessRegistry,
+    power_lease: &mut J,
 ) -> Result<AgentScanResult, String>
 where
     P: ProcessSnapshotBackend,
     W: PowerManagerBackend,
+    J: power_lease::PowerLeaseJournal,
 {
     let tracked_processes = process_backend
-        .list_processes()
+        .list_processes_for_tracking()
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter_map(|process| tracked_process_from_snapshot(config, watch_set, process));
     registry.replace(tracked_processes);
-    evaluate_agent_processes_stateful(
+    evaluate_agent_processes_with_journal(
         config,
         &registry.processes(),
         power_backend,
         state,
         now_ms(),
+        power_lease,
     )
 }
 
-fn evaluate_registry_with_paths<W>(
+fn evaluate_registry_with_paths<W, J>(
     paths: &AgentPaths,
     power_backend: &W,
     state: &mut AgentRuntimeState,
     config: &AppConfig,
     registry: &ProcessRegistry,
+    power_lease: &mut J,
 ) -> Result<AgentScanResult, String>
 where
     W: PowerManagerBackend,
+    J: power_lease::PowerLeaseJournal,
 {
-    let result = evaluate_agent_processes_stateful(
+    let result = evaluate_agent_processes_with_journal(
         config,
         &registry.processes(),
         power_backend,
         state,
         now_ms(),
+        power_lease,
     );
     write_scan_event(&paths.events, &result, power_backend);
     result
@@ -541,10 +603,6 @@ fn next_restore_wait_at(state: &AgentRuntimeState, now_ms: u64) -> Option<Durati
         .map(|restore| Duration::from_millis(restore.due_at_ms.saturating_sub(now_ms)))
 }
 
-fn restore_due(state: &AgentRuntimeState) -> bool {
-    restore_due_at(state, now_ms())
-}
-
 fn restore_due_at(state: &AgentRuntimeState, now_ms: u64) -> bool {
     state
         .pending_restore
@@ -557,6 +615,13 @@ fn load_agent_config(path: &std::path::Path) -> Result<AppConfig, String> {
         return ConfigStore::load_with_backup(path).map_err(|error| error.to_string());
     }
     Ok(AppConfig::default())
+}
+
+fn load_agent_config_for_startup(path: &std::path::Path) -> (AppConfig, Option<String>) {
+    match load_agent_config(path) {
+        Ok(config) => (config, None),
+        Err(error) => (AppConfig::default(), Some(error)),
+    }
 }
 
 fn now_ms() -> u64 {
@@ -684,6 +749,75 @@ mod tests {
 
         assert_eq!(config, AppConfig::default());
         assert!(!paths.config.exists());
+        let _ = std::fs::remove_dir_all(paths.runtime_dir());
+    }
+
+    #[test]
+    fn invalid_startup_config_keeps_agent_in_safe_recoverable_mode() {
+        let paths = temp_agent_paths("invalid-startup-config");
+        std::fs::write(&paths.config, b"{invalid").expect("seed invalid config");
+
+        let (config, error) = load_agent_config_for_startup(&paths.config);
+
+        assert_eq!(config, AppConfig::default());
+        assert!(error
+            .as_deref()
+            .is_some_and(|value| value.contains("Invalid config JSON")));
+        assert_eq!(
+            std::fs::read_to_string(&paths.config).expect("config remains user owned"),
+            "{invalid"
+        );
+        let _ = std::fs::remove_dir_all(paths.runtime_dir());
+    }
+
+    #[test]
+    fn runtime_reconcile_uses_last_valid_config_to_finish_a_due_restore() {
+        let paths = temp_agent_paths("invalid-runtime-config-restore");
+        std::fs::write(&paths.config, b"{invalid").expect("seed invalid config");
+        let processes = FakeProcessBackend {
+            processes: Vec::new(),
+        };
+        let power = power("high");
+        let mut state = AgentRuntimeState {
+            pending_restore: Some(PendingRestoreState {
+                due_at_ms: 0,
+                plan_id: "balanced".to_string(),
+                profile_id: "demo".to_string(),
+                profile_name: "Demo Game".to_string(),
+            }),
+            ..AgentRuntimeState::default()
+        };
+        let mut last_valid_config = config();
+        let mut watch_set = AgentWatchSet::from_config(&last_valid_config);
+        let mut registry = ProcessRegistry::default();
+        let mut lease =
+            PowerLeaseStore::open(paths.power_control_lease()).expect("open power lease");
+
+        let outcome = refresh_config_and_reconcile(
+            &paths,
+            &processes,
+            &power,
+            AgentReconcileContext {
+                state: &mut state,
+                config: &mut last_valid_config,
+                watch_set: &mut watch_set,
+                registry: &mut registry,
+                power_lease: &mut lease,
+            },
+        );
+
+        let scan = outcome.scan_result.expect("restore using cached config");
+        assert!(scan.restored_power_plan);
+        assert_eq!(
+            power.set_calls.borrow().as_slice(),
+            &["balanced".to_string()]
+        );
+        assert!(state.pending_restore.is_none());
+        assert!(outcome
+            .config_warning
+            .as_deref()
+            .is_some_and(|warning| { warning.contains("se conserva la ultima version valida") }));
+        assert_eq!(last_valid_config, config());
         let _ = std::fs::remove_dir_all(paths.runtime_dir());
     }
 
@@ -857,6 +991,7 @@ mod tests {
             matched_profile_id: Some("demo".to_string()),
             matched_profile_name: Some("Demo Game".to_string()),
             target_plan_id: Some("high".to_string()),
+            restore_profile_id: None,
             restore_profile_name: None,
             active_profiles: vec![AgentActiveProfile {
                 profile_id: "demo".to_string(),
@@ -966,16 +1101,23 @@ mod tests {
     fn ipc_mutations_reject_missing_or_invalid_control_token() {
         let shared = AgentSharedState::default();
         let (sender, receiver) = mpsc::channel();
-        let request = serde_json::to_string(&AgentIpcRequest::Shutdown {
-            token: Some("wrong".to_string()),
-        })
-        .expect("request json");
+        let requests = [
+            AgentIpcRequest::Shutdown {
+                token: Some("wrong".to_string()),
+            },
+            AgentIpcRequest::SetStartup {
+                enabled: false,
+                token: Some("wrong".to_string()),
+            },
+        ];
 
-        let response: AgentIpcResponse =
-            serde_json::from_str(&handle_test_ipc_request(&request, &shared, &sender))
-                .expect("response json");
-
-        assert!(!response.ok);
+        for request in requests {
+            let request = serde_json::to_string(&request).expect("request json");
+            let response: AgentIpcResponse =
+                serde_json::from_str(&handle_test_ipc_request(&request, &shared, &sender))
+                    .expect("response json");
+            assert!(!response.ok);
+        }
         assert!(receiver.try_recv().is_err());
     }
 
@@ -1303,7 +1445,7 @@ mod tests {
 
         assert!(scheduler.record_public_wake(1_000));
         assert!(scheduler.due(1_000));
-        scheduler.mark_scan_completed(1_000);
+        scheduler.mark_scan_completed(1_000, false);
 
         assert!(!scheduler.record_public_wake(1_500));
         assert_eq!(scheduler.next_wait(1_500), None);
@@ -1358,6 +1500,7 @@ mod tests {
             matched_profile_id: Some("demo".to_string()),
             matched_profile_name: Some("Demo".to_string()),
             target_plan_id: Some("high".to_string()),
+            restore_profile_id: None,
             restore_profile_name: None,
             active_profiles: vec![AgentActiveProfile {
                 profile_id: "demo".to_string(),
@@ -1374,6 +1517,7 @@ mod tests {
             matched_profile_id: None,
             matched_profile_name: None,
             target_plan_id: None,
+            restore_profile_id: None,
             restore_profile_name: None,
             active_profiles: Vec::new(),
             changed_power_plan: false,
@@ -1395,6 +1539,7 @@ mod tests {
             matched_profile_id: Some("chrome".to_string()),
             matched_profile_name: Some("Chrome".to_string()),
             target_plan_id: Some(plan_id.to_string()),
+            restore_profile_id: None,
             restore_profile_name: None,
             active_profiles: vec![AgentActiveProfile {
                 profile_id: "chrome".to_string(),
@@ -1421,6 +1566,7 @@ mod tests {
             matched_profile_id: None,
             matched_profile_name: None,
             target_plan_id: Some("balanced".to_string()),
+            restore_profile_id: Some("demo".to_string()),
             restore_profile_name: Some("Demo Game".to_string()),
             active_profiles: Vec::new(),
             changed_power_plan: true,
@@ -1432,6 +1578,7 @@ mod tests {
         let event = scan_event_entry(&restored, &power).expect("restore event");
 
         assert_eq!(event.kind, "power_plan_restored");
+        assert_eq!(event.profile_id.as_deref(), Some("demo"));
         assert_eq!(event.profile_name.as_deref(), Some("Demo Game"));
     }
 
@@ -1680,26 +1827,6 @@ mod tests {
             Some(Duration::from_secs(119))
         );
         assert!(!restore_due_at(&state, 1_000));
-    }
-
-    #[test]
-    fn degraded_watcher_caps_wait_to_adaptive_scan_interval() {
-        let mut health = WmiWatcherStatus::default();
-        health.mark_degraded(
-            powershift_windows::ProcessWatcherKind::Starts,
-            "test".to_string(),
-            1_000,
-            10,
-        );
-
-        assert_eq!(
-            next_wait_with_scheduler(
-                &AgentRuntimeState::default(),
-                &AgentScanScheduler::default(),
-                health.is_degraded()
-            ),
-            Some(DEGRADED_PROCESS_SCAN_INTERVAL)
-        );
     }
 
     #[test]

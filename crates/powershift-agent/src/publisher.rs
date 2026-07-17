@@ -24,7 +24,11 @@ pub struct EventLogEntry {
     pub level: String,
     pub kind: String,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan_id: Option<String>,
 }
 
@@ -35,6 +39,7 @@ impl EventLogEntry {
             level: "info".to_string(),
             kind: kind.into(),
             message: message.into(),
+            profile_id: None,
             profile_name: None,
             plan_id: None,
         }
@@ -46,6 +51,7 @@ impl EventLogEntry {
             level: "error".to_string(),
             kind: kind.into(),
             message: message.into(),
+            profile_id: None,
             profile_name: None,
             plan_id: None,
         }
@@ -174,6 +180,7 @@ where
                 "profile_activated",
                 activation_event_message(profile_name, plan_name.as_deref()),
             );
+            event.profile_id = scan.matched_profile_id.clone();
             event.profile_name = Some(profile_name.to_string());
             event.plan_id = scan.target_plan_id.clone();
             Some(event)
@@ -188,6 +195,7 @@ where
                     None => "Restore de plan programado tras cerrar el perfil".to_string(),
                 },
             );
+            event.profile_id = scan.restore_profile_id.clone();
             event.profile_name = scan.restore_profile_name.clone();
             Some(event)
         }
@@ -200,6 +208,7 @@ where
                 "power_plan_restored",
                 restore_event_message(plan_name.as_deref()),
             );
+            event.profile_id = scan.restore_profile_id.clone();
             event.profile_name = scan.restore_profile_name.clone();
             event.plan_id = scan.target_plan_id.clone();
             Some(event)

@@ -1,6 +1,5 @@
-use crate::{PowerResult, ProcessWatchMessage};
+use crate::{PowerError, PowerResult, ProcessWatchMessage};
 use powershift_core::ProcessInfo;
-use sysinfo::System;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ProcessInstanceId {
@@ -40,6 +39,13 @@ impl std::fmt::Debug for ProcessExitWatch {
 
 pub trait ProcessSnapshotBackend {
     fn list_processes(&self) -> PowerResult<Vec<ProcessInfo>>;
+
+    /// Lightweight process-table snapshot for the background agent. Backends
+    /// may omit executable paths because the agent resolves metadata only for
+    /// names that can affect a configured profile.
+    fn list_processes_for_tracking(&self) -> PowerResult<Vec<ProcessInfo>> {
+        self.list_processes()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -47,20 +53,101 @@ pub struct SystemProcessBackend;
 
 impl ProcessSnapshotBackend for SystemProcessBackend {
     fn list_processes(&self) -> PowerResult<Vec<ProcessInfo>> {
-        let mut system = System::new();
-        system.refresh_processes();
-        Ok(sort_processes(
-            system
-                .processes()
-                .iter()
-                .map(|(pid, process)| ProcessInfo {
-                    pid: pid.as_u32(),
-                    name: process.name().to_string(),
-                    path: process_path(process),
-                })
-                .collect(),
-        ))
+        platform_list_processes(true).map(sort_processes)
     }
+
+    fn list_processes_for_tracking(&self) -> PowerResult<Vec<ProcessInfo>> {
+        platform_list_processes(false).map(sort_processes)
+    }
+}
+
+#[cfg(windows)]
+fn platform_list_processes(include_paths: bool) -> PowerResult<Vec<ProcessInfo>> {
+    use windows::Win32::Foundation::{CloseHandle, ERROR_NO_MORE_FILES};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let current_session_id = process_session_id(std::process::id()).ok_or_else(|| {
+        PowerError::Parse("No se pudo determinar la sesion actual de Windows".to_string())
+    })?;
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }
+        .map_err(|error| PowerError::Parse(format!("CreateToolhelp32Snapshot fallo: {error}")))?;
+    let result = (|| {
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..PROCESSENTRY32W::default()
+        };
+        match unsafe { Process32FirstW(snapshot, &mut entry) } {
+            Ok(()) => {}
+            Err(error) if error.code().0 as u32 == ERROR_NO_MORE_FILES.to_hresult().0 as u32 => {
+                return Ok(Vec::new());
+            }
+            Err(error) => {
+                return Err(PowerError::Parse(format!("Process32FirstW fallo: {error}")));
+            }
+        }
+
+        let mut processes = Vec::new();
+        loop {
+            let name = utf16_nul_terminated(&entry.szExeFile);
+            if entry.th32ProcessID != 0
+                && !name.trim().is_empty()
+                && process_session_id(entry.th32ProcessID) == Some(current_session_id)
+            {
+                processes.push(ProcessInfo {
+                    pid: entry.th32ProcessID,
+                    name,
+                    path: if include_paths {
+                        query_process_path_by_pid(entry.th32ProcessID)
+                    } else {
+                        None
+                    },
+                });
+            }
+
+            match unsafe { Process32NextW(snapshot, &mut entry) } {
+                Ok(()) => {}
+                Err(error)
+                    if error.code().0 as u32 == ERROR_NO_MORE_FILES.to_hresult().0 as u32 =>
+                {
+                    break;
+                }
+                Err(error) => {
+                    return Err(PowerError::Parse(format!("Process32NextW fallo: {error}")));
+                }
+            }
+        }
+        Ok(processes)
+    })();
+    let _ = unsafe { CloseHandle(snapshot) };
+    result
+}
+
+#[cfg(not(windows))]
+fn platform_list_processes(_include_paths: bool) -> PowerResult<Vec<ProcessInfo>> {
+    Err(PowerError::NotSupported("Windows process snapshots"))
+}
+
+#[cfg(windows)]
+fn utf16_nul_terminated(value: &[u16]) -> String {
+    let length = value
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(value.len());
+    String::from_utf16_lossy(&value[..length])
+}
+
+#[cfg(windows)]
+fn query_process_path_by_pid(pid: u32) -> Option<String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let path = query_process_path(handle);
+    let _ = unsafe { CloseHandle(handle) };
+    path
 }
 
 pub fn sort_processes(mut processes: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
@@ -134,7 +221,9 @@ fn platform_inspect_process(pid: u32, fallback_name: &str) -> Option<ObservedPro
         )
     }
     .ok()?;
-    let observed = observed_process_from_handle(handle, pid, fallback_name);
+    let current_session_id = process_session_id(std::process::id());
+    let observed = observed_process_from_handle(handle, pid, fallback_name)
+        .filter(|process| process_is_in_session(process, current_session_id));
     let _ = unsafe { CloseHandle(handle) };
     observed
 }
@@ -250,12 +339,11 @@ impl Drop for ProcessExitWatch {
         use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows::Win32::System::Threading::UnregisterWaitEx;
 
-        let callback_already_started = self.callback.invoked.load(Ordering::Acquire);
-        let unregistered = if callback_already_started {
-            Ok(())
-        } else {
-            unsafe { UnregisterWaitEx(self.wait_handle, Some(INVALID_HANDLE_VALUE)) }
-        };
+        // WT_EXECUTEONLYONCE stops future callbacks but does not release the
+        // registered wait. A synchronous unregister also makes it safe to
+        // reclaim the raw Arc when the callback never ran.
+        let unregistered =
+            unsafe { UnregisterWaitEx(self.wait_handle, Some(INVALID_HANDLE_VALUE)) };
 
         if unregistered.is_ok() {
             if !self.callback.invoked.load(Ordering::Acquire) {
@@ -308,6 +396,10 @@ fn process_session_id(pid: u32) -> Option<u32> {
     unsafe { ProcessIdToSessionId(pid, &mut session_id) }
         .ok()
         .map(|()| session_id)
+}
+
+fn process_is_in_session(process: &ObservedProcess, current_session_id: Option<u32>) -> bool {
+    process.session_id.is_some() && process.session_id == current_session_id
 }
 
 #[cfg(windows)]
@@ -368,13 +460,6 @@ fn file_name_from_path(path: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn process_path(process: &sysinfo::Process) -> Option<String> {
-    process
-        .exe()
-        .filter(|path| !path.as_os_str().is_empty())
-        .map(|path| path.to_string_lossy().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,6 +492,7 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
     fn system_backend_lists_at_least_current_test_process() {
         let processes = SystemProcessBackend
@@ -417,10 +503,45 @@ mod tests {
         assert!(processes.iter().any(|process| !process.name.is_empty()));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn tracking_snapshot_avoids_global_executable_path_queries() {
+        let processes = SystemProcessBackend
+            .list_processes_for_tracking()
+            .expect("list tracking processes");
+
+        assert!(!processes.is_empty());
+        assert!(processes.iter().all(|process| process.path.is_none()));
+    }
+
     #[test]
     fn detects_current_process_as_running() {
         assert!(process_id_is_running(std::process::id()));
         assert!(!process_id_is_running(0));
+    }
+
+    #[test]
+    fn session_filter_rejects_unknown_and_other_windows_sessions() {
+        let process = ObservedProcess {
+            instance: ProcessInstanceId {
+                pid: 42,
+                creation_time: 100,
+            },
+            process: ProcessInfo {
+                pid: 42,
+                name: "game.exe".to_string(),
+                path: None,
+            },
+            session_id: Some(2),
+        };
+
+        assert!(process_is_in_session(&process, Some(2)));
+        assert!(!process_is_in_session(&process, Some(3)));
+        assert!(!process_is_in_session(&process, None));
+
+        let mut unknown = process;
+        unknown.session_id = None;
+        assert!(!process_is_in_session(&unknown, Some(2)));
     }
 
     #[cfg(windows)]

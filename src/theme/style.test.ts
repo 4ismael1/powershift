@@ -8,19 +8,25 @@ const style = readFileSync(fileURLToPath(new URL('./style.css', import.meta.url)
 
 function cssRule(selector: string): string {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  return style.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`))?.[1] ?? '';
+  return style.match(new RegExp(`(?:^|})\\s*${escaped}\\s*\\{([^}]*)\\}`))?.[1] ?? '';
 }
 
 describe('PowerShift layout polish', () => {
   it('keeps profile controls visible without a footer scroll trap', () => {
     const profileColumnRule = cssRule('.profile-column,\n.process-column');
+    const processColumnRule = cssRule('.process-column');
+    const processListRule = cssRule('.process-list');
 
     expect(style).toContain('grid-template-rows: auto minmax(0, 1fr);');
     expect(style).toContain('.profile-test-button');
     expect(style).not.toContain('.profile-footer');
     expect(profileColumnRule).toContain('overflow: hidden;');
     expect(profileColumnRule).not.toContain('overflow-y: auto;');
-    expect(style).toContain('max-height: 104px;');
+    expect(processColumnRule).toContain('grid-template-rows: 26px minmax(0, 1fr) 34px 34px;');
+    expect(processColumnRule).toContain('align-content: stretch;');
+    expect(processListRule).toContain('min-height: 0;');
+    expect(processListRule).toContain('overflow-y: auto;');
+    expect(processListRule).not.toContain('max-height:');
   });
 
   it('keeps command actions inside the compact app width', () => {
@@ -45,10 +51,12 @@ describe('PowerShift layout polish', () => {
 
   it('keeps game row metadata away from the delete action', () => {
     const gameRowRule = cssRule('.game-row');
+    const gameSelectRule = cssRule('.game-select');
     const rowActionRule = cssRule('.row-action');
     const levelBadgeRule = cssRule('.level-badge');
 
-    expect(gameRowRule).toContain('grid-template-columns: 8px 58px minmax(0, 1fr) max-content 32px;');
+    expect(gameRowRule).toContain('grid-template-columns: minmax(0, 1fr) 32px;');
+    expect(gameSelectRule).toContain('grid-template-columns: 8px 58px minmax(0, 1fr) max-content;');
     expect(rowActionRule).toContain('justify-self: end;');
     expect(levelBadgeRule).toContain('width: max-content;');
     expect(levelBadgeRule).toContain('max-width: none;');

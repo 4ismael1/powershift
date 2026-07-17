@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use tauri::Manager;
 
 const AGENT_EXE_NAME: &str = "powershift-agent.exe";
+pub const REPAIR_AGENT_TASK_FLAG: &str = "--repair-agent-task";
 const TASK_RESTART_COUNT: u8 = 3;
 const TASK_RESTART_INTERVAL_MINUTES: u8 = 1;
 const AGENT_START_TIMEOUT: Duration = Duration::from_secs(6);
@@ -93,10 +94,20 @@ pub fn install_agent_task(app: tauri::AppHandle) -> Result<(), String> {
         return ensure_agent_running();
     }
 
-    run_elevated_task_installer(&agent_path)
+    run_elevated_task_installer()
+}
+
+pub fn repair_agent_task_elevated_cli() -> Result<(), String> {
+    let agent_path = agent_exe_path(None)?;
+    register_agent_task(&agent_path)?;
+    ensure_agent_running()
 }
 
 pub fn sync_agent_startup_task(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    if powershift_agent::request_agent_set_startup_via_ipc(enabled).is_ok() {
+        return Ok(());
+    }
+
     if enabled {
         install_agent_task(app.clone())
     } else {
@@ -119,8 +130,30 @@ pub fn ensure_agent_running() -> Result<(), String> {
     run_agent_task()
 }
 
+pub fn stop_agent_task() -> Result<(), String> {
+    if powershift_agent::request_agent_shutdown_via_ipc().is_ok() {
+        return Ok(());
+    }
+    if !agent_task_exists()? {
+        return Ok(());
+    }
+
+    let task_name = powershift_windows::agent_task_name().map_err(|error| error.to_string())?;
+    let status = quiet_command("schtasks")
+        .args(stop_agent_task_args(&task_name))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| error.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err("No se pudo detener la tarea PowerShiftAgent.".to_string())
+    }
+}
+
 fn promote_agent_to_elevated_task(agent_pid: u32) -> Result<(), String> {
-    if !agent_task_installed()? {
+    if !agent_task_exists()? {
         return Err("El agente responde, pero no esta elevado y la tarea PowerShiftAgent no esta instalada.".to_string());
     }
 
@@ -218,13 +251,17 @@ fn run_agent_task_args(task_name: &str) -> [&str; 3] {
     ["/Run", "/TN", task_name]
 }
 
-#[allow(dead_code)]
 fn stop_agent_task_args(task_name: &str) -> [&str; 3] {
     ["/End", "/TN", task_name]
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn agent_task_installed() -> Result<bool, String> {
+pub fn agent_task_installed(app: tauri::AppHandle) -> Result<bool, String> {
+    let agent_path = agent_exe_path(Some(&app))?;
+    agent_task_matches_expected_registration(&agent_path)
+}
+
+fn agent_task_exists() -> Result<bool, String> {
     let task_name = powershift_windows::agent_task_name().map_err(|error| error.to_string())?;
     let status = quiet_command("schtasks")
         .args(["/Query", "/TN", &task_name])
@@ -236,7 +273,7 @@ pub fn agent_task_installed() -> Result<bool, String> {
 }
 
 fn disable_agent_startup_trigger() -> Result<(), String> {
-    if !agent_task_installed()? {
+    if !agent_task_exists()? {
         return Ok(());
     }
 
@@ -319,41 +356,18 @@ fn register_agent_task(agent_path: &Path) -> Result<(), String> {
     }
 }
 
-fn run_elevated_task_installer(agent_path: &Path) -> Result<(), String> {
-    let user_sid =
-        powershift_windows::current_user_sid_string().map_err(|error| error.to_string())?;
-    let task_name = powershift_windows::agent_task_name_for_sid(&user_sid);
-    let command = elevated_install_powershell(agent_path, &task_name, &user_sid);
-    let status = quiet_command("powershell")
-        .args(elevated_powershell_args(&command))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|error| error.to_string())?;
+fn run_elevated_task_installer() -> Result<(), String> {
+    let current_exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let exit_code = powershift_windows::run_elevated_and_wait(&current_exe, REPAIR_AGENT_TASK_FLAG)
+        .map_err(|error| format!("Windows no autorizo la reparacion de PowerShift: {error}"))?;
 
-    if status.success() {
-        Ok(())
+    if exit_code == 0 {
+        wait_for_agent_ipc(AGENT_START_TIMEOUT)
     } else {
-        Err("Windows no autorizo la instalacion elevada del agente.".to_string())
+        Err(format!(
+            "La reparacion elevada de PowerShift termino con el codigo {exit_code}."
+        ))
     }
-}
-
-fn elevated_install_powershell(agent_path: &Path, task_name: &str, user_sid: &str) -> String {
-    let registration_script =
-        scheduled_task_registration_powershell(agent_path, task_name, user_sid);
-    let startup_script = format!(
-        "{registration_script}; \
-         Start-ScheduledTask -TaskName '{task_name}' -ErrorAction SilentlyContinue"
-    );
-    let escaped_script = startup_script.replace('\'', "''");
-    format!(
-        "$script = '{escaped_script}'; \
-         $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script)); \
-         $argsList = @('-NoProfile','-WindowStyle','Hidden','-ExecutionPolicy','Bypass','-EncodedCommand',$encoded); \
-         $p = Start-Process -FilePath powershell.exe -ArgumentList $argsList -Verb RunAs -WindowStyle Hidden -Wait -PassThru; \
-         exit $p.ExitCode"
-    )
 }
 
 fn scheduled_task_registration_powershell(
@@ -374,11 +388,30 @@ fn scheduled_task_registration_powershell(
     )
 }
 
-#[cfg(test)]
-fn task_settings_probe_powershell(task_name: &str) -> String {
-    format!("$task = Get-ScheduledTask -TaskName '{task_name}' -ErrorAction Stop; \
-     if ($task.Settings.DisallowStartIfOnBatteries -or $task.Settings.StopIfGoingOnBatteries -or -not $task.Settings.StartWhenAvailable -or $task.Settings.ExecutionTimeLimit -ne 'PT0S' -or $task.Settings.RestartCount -lt 3) {{ exit 2 }}; \
-     exit 0")
+fn agent_task_matches_expected_registration(agent_path: &Path) -> Result<bool, String> {
+    let task_name = powershift_windows::agent_task_name().map_err(|error| error.to_string())?;
+    let command = task_registration_probe_powershell(&task_name, agent_path);
+    let status = quiet_command("powershell")
+        .args(elevated_powershell_args(&command))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| error.to_string())?;
+    Ok(status.success())
+}
+
+fn task_registration_probe_powershell(task_name: &str, agent_path: &Path) -> String {
+    let escaped_path = agent_path.display().to_string().replace('\'', "''");
+    format!(
+        "$task = Get-ScheduledTask -TaskName '{task_name}' -ErrorAction Stop; \
+         $expected = [IO.Path]::GetFullPath('{escaped_path}'); \
+         if (@($task.Actions).Count -ne 1) {{ exit 2 }}; \
+         $actual = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($task.Actions[0].Execute.Trim('`\"'))); \
+         if ($actual -ine $expected -or $task.Principal.RunLevel -ne 'Highest') {{ exit 2 }}; \
+         if ($task.Settings.DisallowStartIfOnBatteries -or $task.Settings.StopIfGoingOnBatteries -or -not $task.Settings.StartWhenAvailable -or $task.Settings.ExecutionTimeLimit -ne 'PT0S' -or $task.Settings.RestartCount -lt {TASK_RESTART_COUNT}) {{ exit 2 }}; \
+         exit 0"
+    )
 }
 
 fn disable_agent_startup_trigger_powershell(task_name: &str) -> String {
@@ -402,7 +435,7 @@ fn elevated_powershell_args(command: &str) -> [&str; 7] {
 }
 
 fn wake_agent_after_start_attempt(first_error: &str) -> Result<(), String> {
-    if !agent_task_installed()? {
+    if !agent_task_exists()? {
         return Err(agent_wake_missing_task_message(first_error));
     }
 
@@ -463,24 +496,26 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_task_can_start_on_battery_without_killing_running_agent() {
+    fn scheduled_task_can_start_on_battery_and_repair_without_forced_restart() {
         let script = scheduled_task_registration_powershell(
             &PathBuf::from("C:\\PowerShift\\powershift-agent.exe"),
             TEST_TASK_NAME,
             TEST_USER_SID,
         );
-        let elevated = elevated_install_powershell(
-            &PathBuf::from("C:\\PowerShift\\powershift-agent.exe"),
-            TEST_TASK_NAME,
-            TEST_USER_SID,
-        );
+        let source = include_str!("agent_control.rs");
+        let repair = source
+            .split("pub fn repair_agent_task_elevated_cli")
+            .nth(1)
+            .and_then(|source| source.split("pub fn sync_agent_startup_task").next())
+            .expect("repair function");
 
         assert!(script.contains("-AllowStartIfOnBatteries"));
         assert!(script.contains("-DontStopIfGoingOnBatteries"));
         assert!(script.contains("-StartWhenAvailable"));
         assert!(script.contains("-MultipleInstances IgnoreNew"));
-        assert!(elevated.contains("Start-ScheduledTask"));
-        assert!(!elevated.contains("Stop-ScheduledTask"));
+        assert!(repair.contains("register_agent_task"));
+        assert!(repair.contains("ensure_agent_running"));
+        assert!(!repair.contains("restart_agent_task"));
     }
 
     #[test]
@@ -518,9 +553,15 @@ mod tests {
     }
 
     #[test]
-    fn task_settings_probe_detects_legacy_battery_blockers() {
-        let probe = task_settings_probe_powershell(TEST_TASK_NAME);
+    fn task_registration_probe_checks_path_elevation_and_runtime_settings() {
+        let probe = task_registration_probe_powershell(
+            TEST_TASK_NAME,
+            Path::new("C:\\Program Files\\PowerShift\\powershift-agent.exe"),
+        );
 
+        assert!(probe.contains("C:\\Program Files\\PowerShift\\powershift-agent.exe"));
+        assert!(probe.contains("Actions[0].Execute"));
+        assert!(probe.contains("Principal.RunLevel -ne 'Highest'"));
         assert!(probe.contains("DisallowStartIfOnBatteries"));
         assert!(probe.contains("StopIfGoingOnBatteries"));
         assert!(probe.contains("StartWhenAvailable"));
@@ -668,17 +709,26 @@ mod tests {
     }
 
     #[test]
-    fn elevated_installer_uses_uac_runas() {
-        let script = elevated_install_powershell(
-            &PathBuf::from("C:\\PowerShift\\powershift-agent.exe"),
-            TEST_TASK_NAME,
-            TEST_USER_SID,
-        );
+    fn elevated_installer_relaunches_the_signed_powershift_host() {
+        let source = include_str!("agent_control.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
 
-        assert!(script.contains("-Verb RunAs"));
-        assert!(script.contains("-WindowStyle Hidden"));
-        assert!(script.contains("-EncodedCommand"));
-        assert!(script.contains("powershell.exe"));
+        assert_eq!(REPAIR_AGENT_TASK_FLAG, "--repair-agent-task");
+        assert!(production.contains("run_elevated_and_wait"));
+        assert!(!production.contains("Start-Process -FilePath powershell.exe"));
+    }
+
+    #[test]
+    fn startup_setting_prefers_the_running_elevated_agent() {
+        let source = include_str!("agent_control.rs");
+        let sync = source
+            .split("pub fn sync_agent_startup_task")
+            .nth(1)
+            .and_then(|source| source.split("#[tauri::command").next())
+            .expect("startup sync function");
+
+        assert!(sync.contains("request_agent_set_startup_via_ipc"));
+        assert!(sync.find("request_agent_set_startup_via_ipc") < sync.find("install_agent_task"));
     }
 
     #[test]

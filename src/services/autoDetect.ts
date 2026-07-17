@@ -20,6 +20,8 @@ const blockedNames = new Set([
   'explorer.exe',
   'powershell.exe',
   'powershift.exe',
+  'powershift-agent.exe',
+  'powershift-tray.exe',
   'runtimebroker.exe',
   'searchhost.exe',
   'shellexperiencehost.exe',
