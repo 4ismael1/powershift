@@ -274,6 +274,30 @@ mod tests {
     }
 
     #[test]
+    fn migrates_legacy_associated_processes_to_companions() {
+        let mut legacy = valid_config();
+        legacy.version = 4;
+        legacy.profiles[0]
+            .associated_processes
+            .push(crate::ProcessMatcher::by_name("chrome.exe"));
+        let mut value = serde_json::to_value(legacy).expect("legacy value");
+        value["profiles"][0]["associated_processes"][0]
+            .as_object_mut()
+            .expect("matcher object")
+            .remove("role");
+
+        let migrated =
+            ConfigStore::from_json_str(&serde_json::to_string(&value).expect("legacy json"))
+                .expect("migrated config");
+
+        assert_eq!(migrated.version, CURRENT_CONFIG_VERSION);
+        assert_eq!(
+            migrated.profiles[0].associated_processes[0].role,
+            crate::AssociatedProcessRole::Companion
+        );
+    }
+
+    #[test]
     fn saves_and_loads_config_file() {
         let config = valid_config();
         let path = std::env::temp_dir().join(format!(

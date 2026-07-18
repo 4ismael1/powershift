@@ -87,6 +87,11 @@ pub fn wake_agent() -> Result<(), String> {
 }
 
 #[tauri::command(rename_all = "snake_case")]
+pub fn promote_active_profile(profile_id: String) -> Result<(), String> {
+    powershift_agent::request_agent_promote_profile_via_ipc(&profile_id)
+}
+
+#[tauri::command(rename_all = "snake_case")]
 pub fn install_agent_task(app: tauri::AppHandle) -> Result<(), String> {
     let agent_path = agent_exe_path(Some(&app))?;
 

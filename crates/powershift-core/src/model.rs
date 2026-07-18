@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const CURRENT_CONFIG_VERSION: u32 = 4;
+pub const CURRENT_CONFIG_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -128,6 +128,8 @@ pub struct ProcessMatcher {
     pub name: String,
     pub path: Option<String>,
     pub match_mode: MatchMode,
+    #[serde(default)]
+    pub role: AssociatedProcessRole,
 }
 
 impl ProcessMatcher {
@@ -136,8 +138,19 @@ impl ProcessMatcher {
             name: name.into(),
             path: None,
             match_mode: MatchMode::Name,
+            role: AssociatedProcessRole::Companion,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssociatedProcessRole {
+    /// Extends an already active profile session, but cannot start one by itself.
+    #[default]
+    Companion,
+    /// Can start the profile even when the main executable is not running.
+    AlternateTrigger,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

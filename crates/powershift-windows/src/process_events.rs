@@ -49,6 +49,7 @@ pub enum ProcessWatchMessage {
         retry_in_ms: u64,
     },
     Reevaluate,
+    PromoteProfile(String),
     Shutdown,
 }
 

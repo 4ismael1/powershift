@@ -11,6 +11,7 @@ import {
   getAgentState,
   installAgentTask,
   isAgentStateStale,
+  promoteActiveProfile,
   startAgentTask,
   wakeAgent,
 } from './agentApi';
@@ -33,7 +34,7 @@ describe('agentApi', () => {
       startPlan: 'high',
       closePlan: 'Restaurar plan anterior',
       closeDelay: '30 s',
-      processes: [`${id}.exe`],
+      associatedProcesses: [],
       lastEvent: enabled ? 'Inactivo' : 'Deshabilitado',
     };
   }
@@ -65,12 +66,14 @@ describe('agentApi', () => {
     await expect(getAgentState(invokeFn)).resolves.toEqual(state);
     await expect(wakeAgent(invokeFn)).resolves.toBeUndefined();
     await expect(installAgentTask(invokeFn)).resolves.toBeUndefined();
+    await expect(promoteActiveProfile(invokeFn, 'chrome')).resolves.toBeUndefined();
     await expect(startAgentTask(invokeFn)).resolves.toBeUndefined();
     await expect(agentTaskInstalled(invokeFn)).resolves.toBe(true);
 
     expect(mockInvoke).toHaveBeenCalledWith('get_agent_state');
     expect(mockInvoke).toHaveBeenCalledWith('wake_agent');
     expect(mockInvoke).toHaveBeenCalledWith('install_agent_task');
+    expect(mockInvoke).toHaveBeenCalledWith('promote_active_profile', { profile_id: 'chrome' });
     expect(mockInvoke).toHaveBeenCalledWith('start_agent_task');
     expect(mockInvoke).toHaveBeenCalledWith('agent_task_installed');
   });

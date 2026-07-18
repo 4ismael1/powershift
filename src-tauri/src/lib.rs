@@ -44,6 +44,7 @@ pub fn run() {
             agent_control::agent_task_installed,
             agent_control::get_agent_state,
             agent_control::install_agent_task,
+            agent_control::promote_active_profile,
             agent_control::start_agent_task,
             agent_control::wake_agent,
             config::get_app_config,

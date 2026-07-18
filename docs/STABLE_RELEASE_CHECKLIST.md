@@ -26,7 +26,7 @@ follow-up explicitly instead of presenting the gate as completed.
 - [ ] CI uses the repository-pinned Node and Rust toolchains.
 - [ ] The Windows CI workflow builds the NSIS installer from a clean checkout.
 
-## 3. Unsigned Distribution Integrity
+## 3. Initial GitHub Release Integrity
 
 - [ ] The release is explicitly identified as unsigned; no verified-publisher
       claim appears in documentation or release metadata.
@@ -40,6 +40,9 @@ follow-up explicitly instead of presenting the gate as completed.
 PowerShift releases are published manually through GitHub Releases. An in-app
 updater is deferred until a secure update-verification and rollback strategy has
 been designed and tested.
+
+The target Microsoft Store MSIX track is a separate lifecycle. Follow
+`docs/DISTRIBUTION.md`; Store signing does not apply to the GitHub NSIS EXE.
 
 ## 4. Clean Installation Matrix
 
@@ -89,6 +92,13 @@ Run each required case on clean virtual machines, not only the development PC.
 - [ ] A lower-priority profile remains active but cannot override the winner.
 - [ ] Equal-priority profiles keep the current winner to avoid plan oscillation.
 - [ ] Closing the winner transfers control to the next active profile.
+- [ ] A companion process cannot cold-start a profile, keeps a previously
+      started session active, and releases it after both main and companions exit.
+- [ ] An alternate trigger can start its profile without the main executable.
+- [ ] **Take control now** overrides priority only while the promoted profile
+      remains active, then automatically returns to normal conflict resolution.
+- [ ] Editing the controlling profile's start plan reapplies the new configured
+      plan on the next agent evaluation.
 - [ ] Previous-plan and specific-plan restoration both honor their configured
       delay, including zero delay.
 - [ ] Pausing automation stops plan changes while the agent remains healthy.
@@ -156,6 +166,21 @@ through a repeated start/stop workload.
       signed build and its archive contains no config, IPC token, power lease,
       or unrelated personal data.
 
+## 11. Microsoft Store MSIX Readiness
+
+- [ ] Store identity, publisher, package name, and four-part package version are
+      reserved in Partner Center and match the manifest.
+- [ ] A development MSIX packages the UI, elevated agent, tray, and runtime
+      resources without depending on NSIS hooks.
+- [ ] Microsoft has approved the restricted elevation capability, or the agent
+      architecture no longer requires it.
+- [ ] Packaged first launch, startup, upgrade, repair, power-lease recovery, and
+      uninstall pass on clean Windows systems.
+- [ ] Windows App Certification Kit passes and a private Store flight installs,
+      updates, launches, and uninstalls successfully.
+- [ ] The submitted artifact is MSIX/AppX; documentation does not imply that
+      Store re-signs a linked EXE/MSI installer.
+
 ## Release Decision
 
 Record the Windows versions, hardware, installer SHA-256, test date, reviewer,
@@ -172,3 +197,19 @@ follow-up version.
   task elevation, ACL, uninstall, and resource checks were exercised on the
   development system. The complete clean-VM and protected-game matrix remains
   follow-up validation for `1.0.x`.
+
+### v1.1.0 release decision
+
+- Owner: `4ismael1`.
+- The version target is `1.1.0`: associated-process roles and temporary manual
+  control handoff are backward-compatible features, so SemVer requires a minor
+  increment from `1.0.0`.
+- Automated checks, dependency audits, version verification, and the local NSIS
+  build passed and are recorded in `docs/RELEASE_NOTES_1.1.0.md`.
+- Owner `4ismael1` explicitly approved publication with the complete clean
+  Windows 10/11, upgrade, reboot/startup, protected-game, multi-session, repair,
+  and uninstall matrix incomplete. This is an accepted limitation with
+  follow-up assigned to the `1.1.x` line, not a claim that those gates passed.
+- The GitHub NSIS release remains unsigned. The separate Microsoft Store MSIX
+  lifecycle is not a gate for the GitHub release and must not be represented as
+  completed by this candidate.

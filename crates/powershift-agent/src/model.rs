@@ -30,6 +30,9 @@ pub struct AgentActiveProfile {
 pub struct AgentRuntimeState {
     pub active_profile_ids: Vec<String>,
     pub winning_profile_id: Option<String>,
+    /// Ephemeral user-selected winner. It is never persisted and expires as
+    /// soon as the selected profile is no longer active.
+    pub manual_control_profile_id: Option<String>,
     pub previous_plan_id: Option<String>,
     pub pending_restore: Option<PendingRestoreState>,
 }

@@ -6,14 +6,10 @@ import { getVersion } from '@tauri-apps/api/app';
 import {
   Activity,
   CheckCircle2,
-  Cpu,
   FilePlus2,
-  Folder,
   Gauge,
   List,
   Minus,
-  Play,
-  Plus,
   Search,
   Settings,
   SlidersHorizontal,
@@ -34,7 +30,9 @@ import {
   saveAppConfig,
   takeConfigRecoveryWarning,
   updateAppSettingsConfig,
+  updateAssociatedProcessRole,
   updateProfileConfig,
+  type AssociatedProcessRole,
   type AppSettingsUpdate,
   type AppConfig,
   type ConfigSaveOutcome,
@@ -51,6 +49,7 @@ import {
   describeAgentState,
   getAgentState,
   installAgentTask,
+  promoteActiveProfile,
   startAgentTask,
   wakeAgent,
   type AgentStateTone,
@@ -78,6 +77,7 @@ import { openExecutableFolder, openExternalUrl } from '@/services/shellApi';
 import ConfirmDialog from '@/components/ConfirmDialog.vue';
 import EventsDrawer from '@/components/EventsDrawer.vue';
 import ProcessDrawer, { type ProcessDrawerMode } from '@/components/ProcessDrawer.vue';
+import ProfileEditor from '@/components/ProfileEditor.vue';
 import SettingsDrawer from '@/components/SettingsDrawer.vue';
 
 type PowerLevel = 'max' | 'high' | 'balanced';
@@ -184,14 +184,8 @@ function statusLabel(status: GameStatus) {
 }
 
 async function updateSelectedGame(field: 'startPlan' | 'closePlan' | 'closeDelay', value: string) {
-  const game = selectedGame.value;
-  if (game) {
-    game[field] = value;
-    if (field === 'startPlan') {
-      game.level = planToLevel(value, powerPlans.value);
-    }
-    await persistSelectedProfile({ [field]: value });
-  }
+  if (!selectedGame.value) return;
+  await persistSelectedProfile({ [field]: value });
 }
 
 async function refreshPowerState() {
@@ -499,6 +493,10 @@ async function associateOpenProcess(process: ProcessInfo) {
       name: process.name,
       path: process.path ?? null,
     });
+    if (nextConfig === config) {
+      showNotice('info', 'Ese proceso ya forma parte del perfil.');
+      return;
+    }
     const outcome = await persistConfig(nextConfig);
     await refreshRecentEvents();
     currentConfig.value = nextConfig;
@@ -513,15 +511,17 @@ async function associateOpenProcess(process: ProcessInfo) {
   }
 }
 
-async function persistSelectedProfile(update: ProfileUpdate) {
-  if (!selectedGame.value) return;
-  if (typeof update.notify === 'boolean' && !globalNotificationsEnabled.value) return;
+async function persistSelectedProfile(update: ProfileUpdate): Promise<boolean> {
+  if (!selectedGame.value) return false;
+  if (typeof update.notify === 'boolean' && !globalNotificationsEnabled.value) return false;
 
   const profileId = selectedGame.value.id;
+  let sourceConfig = currentConfig.value;
   powerError.value = '';
   powerLoading.value = true;
   try {
-    const config = currentConfig.value ?? (await getAppConfig(tauriInvoke));
+    const config = sourceConfig ?? (await getAppConfig(tauriInvoke));
+    sourceConfig = config;
     const nextConfig = updateProfileConfig(config, profileId, update, powerPlans.value);
     const outcome = await persistConfig(nextConfig);
     await refreshRecentEvents();
@@ -530,8 +530,17 @@ async function persistSelectedProfile(update: ProfileUpdate) {
     selectedId.value = profileId;
     syncProfilePlanSelections(powerPlans.value);
     showSaveOutcome('Perfil actualizado.', outcome);
+    return true;
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
+    if (sourceConfig) {
+      currentConfig.value = sourceConfig;
+      applyConfigProfiles(sourceConfig);
+      selectedId.value = profileId;
+      syncProfilePlanSelections(powerPlans.value);
+    }
+    showNotice('error', powerError.value);
+    return false;
   } finally {
     powerLoading.value = false;
   }
@@ -579,6 +588,10 @@ async function removeAssociatedProcess(processName: string) {
   try {
     const config = currentConfig.value ?? (await getAppConfig(tauriInvoke));
     const nextConfig = removeAssociatedProcessFromProfile(config, profileId, processName);
+    if (nextConfig === config) {
+      showNotice('info', 'El proceso ya no estaba asociado.');
+      return;
+    }
     const outcome = await persistConfig(nextConfig);
     await refreshRecentEvents();
     currentConfig.value = nextConfig;
@@ -588,6 +601,55 @@ async function removeAssociatedProcess(processName: string) {
     showSaveOutcome('Proceso quitado.', outcome);
   } catch (error) {
     powerError.value = error instanceof Error ? error.message : String(error);
+  } finally {
+    powerLoading.value = false;
+  }
+}
+
+async function changeAssociatedProcessRole(processName: string, role: AssociatedProcessRole) {
+  if (!selectedGame.value) return;
+
+  const profileId = selectedGame.value.id;
+  powerError.value = '';
+  powerLoading.value = true;
+  try {
+    const config = currentConfig.value ?? (await getAppConfig(tauriInvoke));
+    const nextConfig = updateAssociatedProcessRole(config, profileId, processName, role);
+    if (nextConfig === config) return;
+    const outcome = await persistConfig(nextConfig);
+    currentConfig.value = nextConfig;
+    applyConfigProfiles(nextConfig);
+    selectedId.value = profileId;
+    showSaveOutcome(
+      role === 'alternate_trigger'
+        ? 'El proceso ahora puede iniciar el perfil.'
+        : 'El proceso ahora solo prolonga una sesión iniciada.',
+      outcome,
+    );
+  } catch (error) {
+    powerError.value = error instanceof Error ? error.message : String(error);
+    showNotice('error', powerError.value);
+  } finally {
+    powerLoading.value = false;
+  }
+}
+
+async function promoteSelectedProfile() {
+  if (!selectedGame.value || selectedGame.value.status !== 'active') return;
+
+  const profileName = selectedGame.value.name;
+  powerError.value = '';
+  powerLoading.value = true;
+  try {
+    await promoteActiveProfile(tauriInvoke, selectedGame.value.id);
+    await refreshAgentSnapshot({ forceLinkedRefresh: true });
+    showNotice(
+      'success',
+      `Traspaso solicitado para ${profileName}; durará mientras el perfil siga activo.`,
+    );
+  } catch (error) {
+    powerError.value = error instanceof Error ? error.message : String(error);
+    showNotice('error', powerError.value);
   } finally {
     powerLoading.value = false;
   }
@@ -1036,161 +1098,25 @@ async function getTauriWindow() {
       </aside>
 
       <section class="details-panel">
-        <div v-if="!selectedGame" class="details-empty-state">
-          <div class="brand-mark">
-            <Zap :size="32" stroke-width="2.7" fill="currentColor" />
-          </div>
-          <strong>No hay perfil seleccionado</strong>
-          <span>Agrega un ejecutable o detecta una aplicacion abierta.</span>
-          <div class="empty-actions">
-            <button class="primary-action compact" :disabled="powerLoading" @click="addExecutableProfile">
-              <FilePlus2 :size="17" />
-              <span>Agregar exe</span>
-            </button>
-            <button class="secondary-action compact" :disabled="powerLoading" @click="autoDetectProfiles">
-              <Sparkles :size="17" />
-              <span>Auto detectar</span>
-            </button>
-          </div>
-        </div>
-
-        <template v-else>
-        <div class="profile-header">
-          <span class="selected-art" :class="{ [selectedGame.iconClass]: !profileIcons[selectedGame.id] }">
-            <img v-if="profileIcons[selectedGame.id]" :src="profileIcons[selectedGame.id]" alt="" />
-            <template v-else>{{ selectedGame.iconText }}</template>
-          </span>
-
-          <div class="identity-fields">
-            <label>
-              <span>Nombre del juego</span>
-              <input
-                :value="selectedGame.name"
-                :disabled="powerLoading"
-                @change="persistSelectedProfile({ name: ($event.target as HTMLInputElement).value })"
-              />
-            </label>
-            <label>
-              <span>Ejecutable</span>
-              <div class="path-field">
-                <input :value="selectedGame.path" :title="selectedGame.path" readonly />
-                <button class="square-tool" :disabled="powerLoading" aria-label="Abrir carpeta del ejecutable" @click="openSelectedExecutableFolder">
-                  <Folder :size="20" />
-                </button>
-              </div>
-            </label>
-          </div>
-        </div>
-
-        <div class="settings-grid">
-          <div class="profile-column">
-            <div class="setting-row compact">
-              <span>Perfil activo</span>
-              <button
-                class="switch"
-                :class="{ on: selectedGame.enabled }"
-                role="switch"
-                :aria-checked="selectedGame.enabled"
-                :disabled="powerLoading"
-                aria-label="Activar perfil"
-                @click="persistSelectedProfile({ enabled: !selectedGame.enabled })"
-              >
-                <span></span>
-              </button>
-            </div>
-
-            <label class="select-field">
-              <span>Plan al iniciar</span>
-              <select
-                :value="selectedGame.startPlan"
-                :disabled="powerLoading"
-                @change="updateSelectedGame('startPlan', ($event.target as HTMLSelectElement).value)"
-              >
-                <option v-for="plan in powerPlanOptions" :key="`start-${plan.id}`" :value="plan.id">
-                  {{ plan.name }}
-                </option>
-              </select>
-            </label>
-
-            <label class="select-field">
-              <span>Al cerrar</span>
-              <select
-                :value="selectedGame.closePlan"
-                :disabled="powerLoading"
-                @change="updateSelectedGame('closePlan', ($event.target as HTMLSelectElement).value)"
-              >
-                <option v-for="plan in powerPlanOptions" :key="`close-${plan.id}`" :value="plan.id">
-                  {{ plan.name }}
-                </option>
-                <option>Restaurar plan anterior</option>
-              </select>
-            </label>
-
-            <label class="select-field">
-              <span>Retardo al cerrar</span>
-              <select
-                :value="selectedGame.closeDelay"
-                :disabled="powerLoading"
-                @change="updateSelectedGame('closeDelay', ($event.target as HTMLSelectElement).value)"
-              >
-                <option v-for="delay in closeDelayOptions" :key="delay" :value="delay">
-                  {{ delay === '0 s' ? 'Sin retardo' : delay }}
-                </option>
-              </select>
-            </label>
-
-          </div>
-
-          <div class="process-column">
-            <div class="setting-row compact">
-              <span>Mostrar notificación</span>
-              <button
-                class="switch"
-                :class="{ on: selectedGame.notify && globalNotificationsEnabled }"
-                :disabled="!globalNotificationsEnabled || powerLoading"
-                role="switch"
-                :aria-checked="selectedGame.notify && globalNotificationsEnabled"
-                aria-label="Mostrar notificación"
-                @click="persistSelectedProfile({ notify: !selectedGame.notify })"
-              >
-                <span></span>
-              </button>
-            </div>
-
-            <div class="process-list">
-              <div class="process-title">Procesos asociados</div>
-              <template v-for="process in selectedGame.processes" :key="process">
-                <div v-if="process.toLowerCase() === selectedGame.exe.toLowerCase()" class="process-row primary-process-row">
-                  <Cpu :size="15" />
-                  <span>{{ process }}</span>
-                  <small class="process-role">Principal</small>
-                </div>
-                <button
-                  v-else
-                  class="process-row"
-                  :disabled="powerLoading"
-                  :aria-label="`Quitar ${process}`"
-                  @click="removeAssociatedProcess(process)"
-                >
-                  <Cpu :size="15" />
-                  <span>{{ process }}</span>
-                  <Trash2 :size="15" />
-                </button>
-              </template>
-            </div>
-
-            <button class="add-process" :disabled="powerLoading" @click="openAssociateProcessPanel">
-              <Plus :size="18" />
-              <span>Agregar proceso</span>
-            </button>
-
-            <button class="test-button profile-test-button" :disabled="powerLoading" @click="testSelectedProfile">
-              <Play :size="15" fill="currentColor" />
-              <span>{{ powerLoading ? 'Aplicando...' : 'Probar perfil' }}</span>
-            </button>
-          </div>
-        </div>
-        </template>
+        <ProfileEditor
+          :game="selectedGame"
+          :icon="selectedGame ? profileIcons[selectedGame.id] : undefined"
+          :busy="powerLoading"
+          :power-plan-options="powerPlanOptions"
+          :close-delay-options="closeDelayOptions"
+          :global-notifications-enabled="globalNotificationsEnabled"
+          :can-promote-control="selectedGame?.status === 'active' && controllingGame?.id !== selectedGame.id"
+          @add-executable="addExecutableProfile"
+          @auto-detect="autoDetectProfiles"
+          @update-profile="persistSelectedProfile"
+          @update-plan="updateSelectedGame"
+          @open-folder="openSelectedExecutableFolder"
+          @remove-associated="removeAssociatedProcess"
+          @update-associated-role="changeAssociatedProcessRole"
+          @associate="openAssociateProcessPanel"
+          @test-profile="testSelectedProfile"
+          @promote-control="promoteSelectedProfile"
+        />
       </section>
     </main>
 

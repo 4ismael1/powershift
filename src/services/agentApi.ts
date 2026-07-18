@@ -56,6 +56,10 @@ export async function wakeAgent(invokeFn: InvokeFn): Promise<void> {
   return invokeFn<void>('wake_agent');
 }
 
+export async function promoteActiveProfile(invokeFn: InvokeFn, profileId: string): Promise<void> {
+  return invokeFn<void>('promote_active_profile', { profile_id: profileId });
+}
+
 export async function installAgentTask(invokeFn: InvokeFn): Promise<void> {
   return invokeFn<void>('install_agent_task');
 }

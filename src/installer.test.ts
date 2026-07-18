@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import agentBuildScript from '../crates/powershift-agent/build.rs?raw';
 import agentManifest from '../crates/powershift-agent/Cargo.toml?raw';
+import packageJsonRaw from '../package.json?raw';
 import trayBuildScript from '../crates/powershift-tray/build.rs?raw';
 import installerHooks from '../src-tauri/nsis/powershift-hooks.nsh?raw';
 import tauriConfigRaw from '../src-tauri/tauri.conf.json?raw';
 
 const tauriConfig = JSON.parse(tauriConfigRaw);
+const packageJson = JSON.parse(packageJsonRaw);
 
 function macroBody(name: string): string {
   const match = installerHooks.match(new RegExp(`!macro ${name}([\\s\\S]*?)!macroend`));
@@ -29,7 +31,7 @@ describe('installer background architecture', () => {
   });
 
   it('ships stable publisher and version metadata in every executable', () => {
-    expect(tauriConfig.version).toBe('1.0.0');
+    expect(tauriConfig.version).toBe(packageJson.version);
     expect(tauriConfig.bundle.publisher).toBe('4ismael1');
     expect(tauriConfig.bundle.copyright).toContain('4ismael1');
     expect(agentManifest).toContain('embed-resource = "3.0.9"');

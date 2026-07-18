@@ -17,7 +17,7 @@ function game(name: string, status: UiGameProfile['status'] = 'inactive'): UiGam
     startPlan: 'high',
     closePlan: 'Restaurar plan anterior',
     closeDelay: '30 s',
-    processes: [`${name}.exe`],
+    associatedProcesses: [],
     lastEvent: status,
   };
 }

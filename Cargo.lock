@@ -2238,7 +2238,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "powershift"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "powershift-agent",
  "powershift-core",
@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "powershift-agent"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "embed-resource",
  "getrandom 0.2.17",
@@ -2264,7 +2264,7 @@ dependencies = [
 
 [[package]]
 name = "powershift-core"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2273,7 +2273,7 @@ dependencies = [
 
 [[package]]
 name = "powershift-tray"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "embed-resource",
  "powershift-windows",
@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "powershift-windows"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "base64 0.22.1",
  "image",

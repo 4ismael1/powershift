@@ -10,7 +10,7 @@ resolver = "2"
 
 [workspace.package]
 edition = "2021"
-version = "1.0.0"
+version = "1.1.0"
 authors = ["4ismael1"]
 license = "GPL-3.0-only"
 repository = "https://github.com/4ismael1/powershift"

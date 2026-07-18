@@ -1,4 +1,4 @@
-use powershift_core::{AgentStatus, AppConfig, ConfigStore};
+use powershift_core::AgentStatus;
 mod engine;
 mod ipc;
 mod model;
@@ -7,13 +7,15 @@ mod power_lease;
 mod process_registry;
 mod process_runtime;
 mod publisher;
+mod runtime_reconcile;
 mod scheduler;
 
 pub use engine::evaluate_agent_scan_stateful;
 pub use ipc::{
-    request_agent_clear_events_via_ipc, request_agent_reevaluate_via_ipc,
-    request_agent_set_startup_via_ipc, request_agent_shutdown_via_ipc,
-    request_agent_status_via_ipc, AgentIpcRequest, AgentIpcResponse,
+    request_agent_clear_events_via_ipc, request_agent_promote_profile_via_ipc,
+    request_agent_reevaluate_via_ipc, request_agent_set_startup_via_ipc,
+    request_agent_shutdown_via_ipc, request_agent_status_via_ipc, AgentIpcRequest,
+    AgentIpcResponse,
 };
 pub use model::{
     AgentActiveProfile, AgentRuntimeState, AgentScanResult, PendingRestoreState,
@@ -25,7 +27,6 @@ pub use publisher::{append_event_to_path, publish_state, EventLogEntry};
 
 #[cfg(test)]
 use engine::evaluate_agent_processes_stateful;
-use engine::evaluate_agent_processes_with_journal;
 #[cfg(test)]
 use ipc::handle_agent_ipc_request;
 use ipc::{load_or_create_control_token, spawn_agent_ipc_server, AgentSharedState};
@@ -38,7 +39,7 @@ use powershift_windows::{
 use process_registry::{ProcessExitWatchSet, ProcessRegistry};
 #[cfg(test)]
 use process_runtime::apply_observed_stop;
-use process_runtime::{apply_observed_start, apply_process_event, tracked_process_from_snapshot};
+use process_runtime::{apply_observed_start, apply_process_event};
 #[cfg(test)]
 use publisher::{
     agent_error_message, publish_error, publish_scan_outcome, scan_event_entry, MAX_EVENT_LOG_BYTES,
@@ -47,11 +48,20 @@ use publisher::{
     publish_error_with_shared, publish_scan_outcome_with_shared, write_scan_event,
     AgentPublishMemory,
 };
+use runtime_reconcile::{
+    evaluate_registry_with_paths, load_agent_config, load_agent_config_for_startup,
+    next_restore_wait_at, receive_process_message, reconcile_process_registry,
+    refresh_config_and_reconcile, restore_due_at, AgentReconcileContext,
+};
 use scheduler::{
     agent_wake_event, is_agent_wake_event, minimum_wait, next_wait_with_scheduler,
     AgentScanScheduler, AgentWatchSet, TargetedInspectionQueue,
 };
 use std::sync::mpsc::{self, RecvTimeoutError};
+
+#[cfg(test)]
+use powershift_core::{AppConfig, ConfigStore};
+#[cfg(test)]
 use std::time::Duration;
 
 fn synchronize_watcher_health(
@@ -380,6 +390,10 @@ pub fn run_agent_forever() -> Result<(), String> {
             Ok(ProcessWatchMessage::Reevaluate) => {
                 scheduler.schedule_forced(now_ms());
             }
+            Ok(ProcessWatchMessage::PromoteProfile(profile_id)) => {
+                runtime.manual_control_profile_id = Some(profile_id);
+                scheduler.schedule_forced(now_ms());
+            }
             Ok(ProcessWatchMessage::Error(error)) => {
                 publish_error_with_shared(&paths, &error, &mut publish_memory, Some(&shared_state))?
             }
@@ -480,148 +494,6 @@ where
         evaluate_agent_scan_stateful(&config, process_backend, power_backend, state, now_ms());
     write_scan_event(&paths.events, &result, power_backend);
     (result, watch_set)
-}
-
-struct AgentReconcileContext<'a> {
-    state: &'a mut AgentRuntimeState,
-    config: &'a mut AppConfig,
-    watch_set: &'a mut AgentWatchSet,
-    registry: &'a mut ProcessRegistry,
-    power_lease: &'a mut PowerLeaseStore,
-}
-
-struct AgentReconcileOutcome {
-    scan_result: Result<AgentScanResult, String>,
-    config_warning: Option<String>,
-}
-
-fn refresh_config_and_reconcile<P, W>(
-    paths: &AgentPaths,
-    process_backend: &P,
-    power_backend: &W,
-    context: AgentReconcileContext<'_>,
-) -> AgentReconcileOutcome
-where
-    P: ProcessSnapshotBackend,
-    W: PowerManagerBackend,
-{
-    let config_warning = match load_agent_config(&paths.config) {
-        Ok(next_config) => {
-            let next_watch_set = AgentWatchSet::from_config(&next_config);
-            *context.config = next_config;
-            *context.watch_set = next_watch_set;
-            None
-        }
-        Err(error) => Some(format!(
-            "No se pudo recargar la configuracion; se conserva la ultima version valida. {error}"
-        )),
-    };
-    let result = reconcile_process_registry(
-        context.config,
-        context.watch_set,
-        process_backend,
-        power_backend,
-        context.state,
-        context.registry,
-        context.power_lease,
-    );
-    write_scan_event(&paths.events, &result, power_backend);
-    AgentReconcileOutcome {
-        scan_result: result,
-        config_warning,
-    }
-}
-
-fn reconcile_process_registry<P, W, J>(
-    config: &AppConfig,
-    watch_set: &AgentWatchSet,
-    process_backend: &P,
-    power_backend: &W,
-    state: &mut AgentRuntimeState,
-    registry: &mut ProcessRegistry,
-    power_lease: &mut J,
-) -> Result<AgentScanResult, String>
-where
-    P: ProcessSnapshotBackend,
-    W: PowerManagerBackend,
-    J: power_lease::PowerLeaseJournal,
-{
-    let tracked_processes = process_backend
-        .list_processes_for_tracking()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .filter_map(|process| tracked_process_from_snapshot(config, watch_set, process));
-    registry.replace(tracked_processes);
-    evaluate_agent_processes_with_journal(
-        config,
-        &registry.processes(),
-        power_backend,
-        state,
-        now_ms(),
-        power_lease,
-    )
-}
-
-fn evaluate_registry_with_paths<W, J>(
-    paths: &AgentPaths,
-    power_backend: &W,
-    state: &mut AgentRuntimeState,
-    config: &AppConfig,
-    registry: &ProcessRegistry,
-    power_lease: &mut J,
-) -> Result<AgentScanResult, String>
-where
-    W: PowerManagerBackend,
-    J: power_lease::PowerLeaseJournal,
-{
-    let result = evaluate_agent_processes_with_journal(
-        config,
-        &registry.processes(),
-        power_backend,
-        state,
-        now_ms(),
-        power_lease,
-    );
-    write_scan_event(&paths.events, &result, power_backend);
-    result
-}
-
-fn receive_process_message(
-    receiver: &mpsc::Receiver<ProcessWatchMessage>,
-    timeout: Option<Duration>,
-) -> Result<ProcessWatchMessage, RecvTimeoutError> {
-    match timeout {
-        Some(timeout) => receiver.recv_timeout(timeout),
-        None => receiver.recv().map_err(|_| RecvTimeoutError::Disconnected),
-    }
-}
-
-fn next_restore_wait_at(state: &AgentRuntimeState, now_ms: u64) -> Option<Duration> {
-    state
-        .pending_restore
-        .as_ref()
-        .map(|restore| Duration::from_millis(restore.due_at_ms.saturating_sub(now_ms)))
-}
-
-fn restore_due_at(state: &AgentRuntimeState, now_ms: u64) -> bool {
-    state
-        .pending_restore
-        .as_ref()
-        .is_some_and(|restore| restore.due_at_ms <= now_ms)
-}
-
-fn load_agent_config(path: &std::path::Path) -> Result<AppConfig, String> {
-    if path.exists() {
-        return ConfigStore::load_with_backup(path).map_err(|error| error.to_string());
-    }
-    Ok(AppConfig::default())
-}
-
-fn load_agent_config_for_startup(path: &std::path::Path) -> (AppConfig, Option<String>) {
-    match load_agent_config(path) {
-        Ok(config) => (config, None),
-        Err(error) => (AppConfig::default(), Some(error)),
-    }
 }
 
 fn now_ms() -> u64 {
@@ -1078,6 +950,61 @@ mod tests {
     }
 
     #[test]
+    fn ipc_promote_profile_sends_authenticated_runtime_message() {
+        let shared = shared_state_with(PublishedAgentState {
+            pid: 44,
+            status: AgentStatus::Running,
+            updated_at_ms: 123,
+            last_scan: Some(active_scan()),
+            last_error: None,
+            process_tracking: ProcessTrackingStatus::default(),
+            wmi_watchers: WmiWatcherStatus::default(),
+        });
+        let (sender, receiver) = mpsc::channel();
+        let request = serde_json::to_string(&AgentIpcRequest::PromoteProfile {
+            profile_id: "demo".to_string(),
+            token: Some(IPC_TEST_TOKEN.to_string()),
+        })
+        .expect("request json");
+
+        let response: AgentIpcResponse =
+            serde_json::from_str(&handle_test_ipc_request(&request, &shared, &sender))
+                .expect("response json");
+
+        assert!(response.ok);
+        assert_eq!(
+            receiver.recv().expect("promotion message"),
+            ProcessWatchMessage::PromoteProfile("demo".to_string())
+        );
+    }
+
+    #[test]
+    fn ipc_promote_profile_rejects_an_inactive_target() {
+        let shared = shared_state_with(PublishedAgentState {
+            pid: 44,
+            status: AgentStatus::Running,
+            updated_at_ms: 123,
+            last_scan: Some(active_scan()),
+            last_error: None,
+            process_tracking: ProcessTrackingStatus::default(),
+            wmi_watchers: WmiWatcherStatus::default(),
+        });
+        let (sender, receiver) = mpsc::channel();
+        let request = serde_json::to_string(&AgentIpcRequest::PromoteProfile {
+            profile_id: "inactive".to_string(),
+            token: Some(IPC_TEST_TOKEN.to_string()),
+        })
+        .expect("request json");
+
+        let response: AgentIpcResponse =
+            serde_json::from_str(&handle_test_ipc_request(&request, &shared, &sender))
+                .expect("response json");
+
+        assert!(!response.ok);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
     fn ipc_shutdown_sends_shutdown_message() {
         let shared = AgentSharedState::default();
         let (sender, receiver) = mpsc::channel();
@@ -1107,6 +1034,10 @@ mod tests {
             },
             AgentIpcRequest::SetStartup {
                 enabled: false,
+                token: Some("wrong".to_string()),
+            },
+            AgentIpcRequest::PromoteProfile {
+                profile_id: "chrome".to_string(),
                 token: Some("wrong".to_string()),
             },
         ];
@@ -1357,6 +1288,7 @@ mod tests {
         let mut state = AgentRuntimeState {
             active_profile_ids: vec!["chrome".to_string()],
             winning_profile_id: Some("chrome".to_string()),
+            manual_control_profile_id: None,
             previous_plan_id: Some("balanced".to_string()),
             pending_restore: None,
         };
@@ -1415,6 +1347,7 @@ mod tests {
                 name: String::new(),
                 path: Some("D:\\Games\\Folder".to_string()),
                 match_mode: powershift_core::MatchMode::Folder,
+                role: powershift_core::AssociatedProcessRole::Companion,
             });
         let watch_set = AgentWatchSet::from_config(&AppConfig {
             profiles: vec![profile],

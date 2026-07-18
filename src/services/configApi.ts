@@ -1,5 +1,13 @@
 import type { InvokeFn, PowerPlan } from './powerApi';
 
+export type MatchMode = 'name' | 'path' | 'path_or_name' | 'folder';
+export type AssociatedProcessRole = 'companion' | 'alternate_trigger';
+export type RestoreBehavior = 'previous_plan' | 'specific_plan' | 'do_nothing';
+export type CloseButtonBehavior = 'hide_window' | 'exit_app' | 'ask';
+
+export const RESTORE_PREVIOUS_OPTION = '__powershift_previous_plan__';
+export const RESTORE_NOTHING_OPTION = '__powershift_do_nothing__';
+
 export interface AppConfig {
   version: number;
   agent: AgentSettings;
@@ -22,7 +30,7 @@ export interface AutomationSettings {
 }
 
 export interface UiSettings {
-  close_button_behavior: string;
+  close_button_behavior: CloseButtonBehavior;
 }
 
 export interface ProfileConfig {
@@ -36,15 +44,16 @@ export interface ProfileConfig {
   associated_processes: Array<{
     name: string;
     path?: string | null;
-    match_mode: string;
+    match_mode: MatchMode;
+    role?: AssociatedProcessRole;
   }>;
   activation: {
-    match_mode: string;
+    match_mode: MatchMode;
     require_main_process: boolean;
   };
   power: {
     on_start_plan_id: string;
-    on_close_behavior: string;
+    on_close_behavior: RestoreBehavior;
     on_close_plan_id?: string | null;
     close_delay_seconds: number;
     priority: number;
@@ -74,7 +83,10 @@ export interface UiGameProfile {
   startPlan: string;
   closePlan: string;
   closeDelay: string;
-  processes: string[];
+  associatedProcesses: Array<{
+    name: string;
+    role: AssociatedProcessRole;
+  }>;
   lastEvent: string;
 }
 
@@ -91,6 +103,7 @@ export interface ProfileUpdate {
 export interface AssociatedProcessInput {
   name: string;
   path?: string | null;
+  role?: AssociatedProcessRole;
 }
 
 export interface AppSettingsUpdate {
@@ -99,7 +112,7 @@ export interface AppSettingsUpdate {
   startWithWindows?: boolean;
   startMinimized?: boolean;
   showTrayIcon?: boolean;
-  closeButtonBehavior?: string;
+  closeButtonBehavior?: CloseButtonBehavior;
   notificationsEnabled?: boolean;
 }
 
@@ -135,15 +148,14 @@ export function profilesToUiGames(config: AppConfig, powerPlans: PowerPlan[] = [
     enabled: profile.enabled,
     notify: profile.notifications.on_activate || profile.notifications.on_restore,
     startPlan: profile.power.on_start_plan_id,
-    closePlan:
-      profile.power.on_close_behavior === 'specific_plan'
-        ? profile.power.on_close_plan_id || ''
-        : 'Restaurar plan anterior',
+    closePlan: closePlanOption(profile),
     closeDelay: `${profile.power.close_delay_seconds} s`,
-    processes: [
-      profile.main_executable.name,
-      ...profile.associated_processes.map((process) => process.name).filter(Boolean),
-    ],
+    associatedProcesses: profile.associated_processes
+      .filter((process) => Boolean(process.name))
+      .map((process) => ({
+        name: process.name,
+        role: process.role ?? 'companion',
+      })),
     lastEvent: profile.enabled ? 'Inactivo' : 'Deshabilitado',
   }));
 }
@@ -232,8 +244,11 @@ export function updateProfileConfig(
       };
 
       if (update.closePlan) {
-        if (update.closePlan === 'Restaurar plan anterior') {
+        if (update.closePlan === RESTORE_PREVIOUS_OPTION) {
           nextProfile.power.on_close_behavior = 'previous_plan';
+          nextProfile.power.on_close_plan_id = null;
+        } else if (update.closePlan === RESTORE_NOTHING_OPTION) {
+          nextProfile.power.on_close_behavior = 'do_nothing';
           nextProfile.power.on_close_plan_id = null;
         } else {
           nextProfile.power.on_close_behavior = 'specific_plan';
@@ -253,28 +268,59 @@ export function addAssociatedProcessToProfile(
 ): AppConfig {
   const processName = process.name.trim();
   if (!processName) return config;
+  const normalizedName = processName.toLowerCase();
+  const profile = config.profiles.find((item) => item.id === profileId);
+  if (!profile || profile.main_executable.name.toLowerCase() === normalizedName) return config;
+  if (profile.associated_processes.some((item) => item.name.toLowerCase() === normalizedName)) {
+    return config;
+  }
+
+  const nextProfile: ProfileConfig = {
+    ...profile,
+    associated_processes: [
+      ...profile.associated_processes,
+      {
+        name: processName,
+        path: process.path ?? null,
+        match_mode: process.path ? 'path_or_name' : 'name',
+        role: process.role ?? 'companion',
+      },
+    ],
+  };
 
   return {
     ...config,
-    profiles: config.profiles.map((profile) => {
-      if (profile.id !== profileId) return profile;
-      if (profile.main_executable.name.toLowerCase() === processName.toLowerCase()) return profile;
-      if (profile.associated_processes.some((item) => item.name.toLowerCase() === processName.toLowerCase())) {
-        return profile;
-      }
+    profiles: config.profiles.map((item) => (item.id === profileId ? nextProfile : item)),
+  };
+}
 
-      return {
-        ...profile,
-        associated_processes: [
-          ...profile.associated_processes,
-          {
-            name: processName,
-            path: process.path ?? null,
-            match_mode: process.path ? 'path_or_name' : 'name',
-          },
-        ],
-      };
-    }),
+export function updateAssociatedProcessRole(
+  config: AppConfig,
+  profileId: string,
+  processName: string,
+  role: AssociatedProcessRole,
+): AppConfig {
+  const normalizedName = processName.trim().toLowerCase();
+  const profile = config.profiles.find((item) => item.id === profileId);
+  if (!profile || !normalizedName) return config;
+
+  let changed = false;
+  const associatedProcesses = profile.associated_processes.map((process) => {
+    if (process.name.toLowerCase() !== normalizedName || (process.role ?? 'companion') === role) {
+      return process;
+    }
+    changed = true;
+    return { ...process, role };
+  });
+  if (!changed) return config;
+
+  const nextProfile: ProfileConfig = {
+    ...profile,
+    associated_processes: associatedProcesses,
+  };
+  return {
+    ...config,
+    profiles: config.profiles.map((item) => (item.id === profileId ? nextProfile : item)),
   };
 }
 
@@ -285,20 +331,22 @@ export function removeAssociatedProcessFromProfile(
 ): AppConfig {
   const normalizedName = processName.trim().toLowerCase();
   if (!normalizedName) return config;
+  const profile = config.profiles.find((item) => item.id === profileId);
+  if (!profile || profile.main_executable.name.toLowerCase() === normalizedName) return config;
+
+  const associatedProcesses = profile.associated_processes.filter(
+    (process) => process.name.toLowerCase() !== normalizedName,
+  );
+  if (associatedProcesses.length === profile.associated_processes.length) return config;
+
+  const nextProfile: ProfileConfig = {
+    ...profile,
+    associated_processes: associatedProcesses,
+  };
 
   return {
     ...config,
-    profiles: config.profiles.map((profile) => {
-      if (profile.id !== profileId) return profile;
-      if (profile.main_executable.name.toLowerCase() === normalizedName) return profile;
-
-      return {
-        ...profile,
-        associated_processes: profile.associated_processes.filter(
-          (process) => process.name.toLowerCase() !== normalizedName,
-        ),
-      };
-    }),
+    profiles: config.profiles.map((item) => (item.id === profileId ? nextProfile : item)),
   };
 }
 
@@ -380,6 +428,16 @@ export function createProfileFromExecutable(executablePath: string, options: Cre
 
 export function planToLevel(planId: string, powerPlans: PowerPlan[] = [], fallbackPriority = 70): UiGameProfile['level'] {
   return inferredLevelForPlan(planId, powerPlans) ?? priorityToLevel(fallbackPriority);
+}
+
+function closePlanOption(profile: ProfileConfig): string {
+  if (profile.power.on_close_behavior === 'specific_plan') {
+    return profile.power.on_close_plan_id || '';
+  }
+  if (profile.power.on_close_behavior === 'do_nothing') {
+    return RESTORE_NOTHING_OPTION;
+  }
+  return RESTORE_PREVIOUS_OPTION;
 }
 
 function inferredLevelForPlan(planId: string, powerPlans: PowerPlan[]): UiGameProfile['level'] | null {

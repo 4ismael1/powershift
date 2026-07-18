@@ -19,8 +19,12 @@ const processDrawerSource = readFileSync(
   fileURLToPath(new URL('./components/ProcessDrawer.vue', import.meta.url)),
   'utf8',
 );
+const profileEditorSource = readFileSync(
+  fileURLToPath(new URL('./components/ProfileEditor.vue', import.meta.url)),
+  'utf8',
+);
 const htmlSource = readFileSync(fileURLToPath(new URL('../index.html', import.meta.url)), 'utf8');
-const drawerSources = `${source}\n${settingsDrawerSource}\n${eventsDrawerSource}\n${processDrawerSource}`;
+const drawerSources = `${source}\n${profileEditorSource}\n${settingsDrawerSource}\n${eventsDrawerSource}\n${processDrawerSource}`;
 
 describe('PowerShift accessibility contracts', () => {
   it('exposes every toggle with switch semantics and checked state', () => {

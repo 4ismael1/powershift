@@ -7,11 +7,14 @@ import {
   normalizeProfilePriorities,
   planToLevel,
   profilesToUiGames,
+  RESTORE_NOTHING_OPTION,
+  RESTORE_PREVIOUS_OPTION,
   removeAssociatedProcessFromProfile,
   removeProfileFromConfig,
   saveAppConfig,
   takeConfigRecoveryWarning,
   updateAppSettingsConfig,
+  updateAssociatedProcessRole,
   updateProfileConfig,
   type AppConfig,
 } from './configApi';
@@ -107,7 +110,7 @@ describe('configApi', () => {
         startPlan: 'high',
         closePlan: 'balanced',
         closeDelay: '45 s',
-        processes: ['notepad.exe', 'helper.exe'],
+        associatedProcesses: [{ name: 'helper.exe', role: 'companion' }],
         lastEvent: 'Inactivo',
       },
     ]);
@@ -125,8 +128,23 @@ describe('configApi', () => {
 
     expect(game.status).toBe('disabled');
     expect(game.level).toBe('balanced');
-    expect(game.closePlan).toBe('Restaurar plan anterior');
+    expect(game.closePlan).toBe(RESTORE_PREVIOUS_OPTION);
     expect(game.lastEvent).toBe('Deshabilitado');
+  });
+
+  it('preserves do-nothing restore behavior in the UI model', () => {
+    const config = configWithProfiles();
+    config.profiles[0].power.on_close_behavior = 'do_nothing';
+    config.profiles[0].power.on_close_plan_id = null;
+
+    const [game] = profilesToUiGames(config);
+    const nextConfig = updateProfileConfig(config, 'notepad', {
+      closePlan: RESTORE_NOTHING_OPTION,
+    });
+
+    expect(game.closePlan).toBe(RESTORE_NOTHING_OPTION);
+    expect(nextConfig.profiles[0].power.on_close_behavior).toBe('do_nothing');
+    expect(nextConfig.profiles[0].power.on_close_plan_id).toBeNull();
   });
 
   it('uses the selected start power plan for the level badge', () => {
@@ -294,7 +312,7 @@ describe('configApi', () => {
     const config = configWithProfiles();
 
     const nextConfig = updateProfileConfig(config, 'notepad', {
-      closePlan: 'Restaurar plan anterior',
+      closePlan: RESTORE_PREVIOUS_OPTION,
     });
 
     expect(nextConfig.profiles[0].power.on_close_behavior).toBe('previous_plan');
@@ -321,8 +339,30 @@ describe('configApi', () => {
       name: 'overlay.exe',
       path: 'C:\\Tools\\overlay.exe',
       match_mode: 'path_or_name',
+      role: 'companion',
     });
     expect(config.profiles[0].associated_processes).toHaveLength(1);
+  });
+
+  it('changes an associated process between companion and alternate trigger', () => {
+    const config = configWithProfiles();
+
+    const alternate = updateAssociatedProcessRole(
+      config,
+      'notepad',
+      'helper.exe',
+      'alternate_trigger',
+    );
+    const unchanged = updateAssociatedProcessRole(
+      alternate,
+      'notepad',
+      'helper.exe',
+      'alternate_trigger',
+    );
+
+    expect(alternate.profiles[0].associated_processes[0].role).toBe('alternate_trigger');
+    expect(config.profiles[0].associated_processes[0].role).toBeUndefined();
+    expect(unchanged).toBe(alternate);
   });
 
   it('does not duplicate associated processes or add the main executable as associated', () => {
@@ -339,6 +379,8 @@ describe('configApi', () => {
 
     expect(withDuplicate.profiles[0].associated_processes).toHaveLength(1);
     expect(withMain.profiles[0].associated_processes).toHaveLength(1);
+    expect(withDuplicate).toBe(config);
+    expect(withMain).toBe(config);
   });
 
   it('removes an associated process without removing the main executable', () => {
@@ -350,6 +392,7 @@ describe('configApi', () => {
     expect(config.profiles[0].associated_processes).toHaveLength(1);
     expect(withoutHelper.profiles[0].associated_processes).toHaveLength(0);
     expect(withoutMain.profiles[0].associated_processes).toHaveLength(1);
+    expect(withoutMain).toBe(config);
   });
 
   it('updates general app settings without mutating the original config', () => {

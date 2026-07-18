@@ -11,6 +11,10 @@ pub enum AgentIpcRequest {
     Reevaluate {
         token: Option<String>,
     },
+    PromoteProfile {
+        profile_id: String,
+        token: Option<String>,
+    },
     SetStartup {
         enabled: bool,
         token: Option<String>,
@@ -70,6 +74,20 @@ pub fn request_agent_reevaluate_via_ipc() -> Result<(), String> {
         Err(response
             .message
             .unwrap_or_else(|| "El agente no acepto revaluar.".to_string()))
+    }
+}
+
+pub fn request_agent_promote_profile_via_ipc(profile_id: &str) -> Result<(), String> {
+    let response = call_agent_ipc(AgentIpcRequest::PromoteProfile {
+        profile_id: profile_id.to_string(),
+        token: read_control_token_from_app_data(),
+    })?;
+    if response.ok {
+        Ok(())
+    } else {
+        Err(response
+            .message
+            .unwrap_or_else(|| "El agente no acepto el traspaso de control.".to_string()))
     }
 }
 
@@ -221,6 +239,46 @@ pub(crate) fn handle_agent_ipc_request(
                 },
             }
         }
+        Ok(AgentIpcRequest::PromoteProfile { profile_id, token }) => {
+            if !control_token_matches(token.as_deref(), control_token) {
+                return agent_ipc_response_json(AgentIpcResponse {
+                    ok: false,
+                    state: shared_state.get(),
+                    message: Some("Token IPC de control invalido.".to_string()),
+                });
+            }
+            let profile_id = profile_id.trim();
+            if profile_id.is_empty() || profile_id.len() > 128 {
+                return agent_ipc_response_json(AgentIpcResponse {
+                    ok: false,
+                    state: shared_state.get(),
+                    message: Some("Identificador de perfil invalido.".to_string()),
+                });
+            }
+            if !shared_state
+                .get()
+                .as_ref()
+                .is_some_and(|state| published_state_has_active_profile(state, profile_id))
+            {
+                return agent_ipc_response_json(AgentIpcResponse {
+                    ok: false,
+                    state: shared_state.get(),
+                    message: Some("El perfil solicitado no esta activo.".to_string()),
+                });
+            }
+            match sender.send(ProcessWatchMessage::PromoteProfile(profile_id.to_string())) {
+                Ok(()) => AgentIpcResponse {
+                    ok: true,
+                    state: shared_state.get(),
+                    message: Some("Traspaso temporal de control solicitado.".to_string()),
+                },
+                Err(error) => AgentIpcResponse {
+                    ok: false,
+                    state: shared_state.get(),
+                    message: Some(error.to_string()),
+                },
+            }
+        }
         Ok(AgentIpcRequest::SetStartup { enabled, token }) => {
             if !control_token_matches(token.as_deref(), control_token) {
                 return agent_ipc_response_json(AgentIpcResponse {
@@ -296,6 +354,16 @@ pub(crate) fn handle_agent_ipc_request(
     };
 
     agent_ipc_response_json(response)
+}
+
+fn published_state_has_active_profile(state: &PublishedAgentState, profile_id: &str) -> bool {
+    state.last_scan.as_ref().is_some_and(|scan| {
+        scan.matched_profile_id.as_deref() == Some(profile_id)
+            || scan
+                .active_profiles
+                .iter()
+                .any(|profile| profile.profile_id == profile_id)
+    })
 }
 
 fn control_token_matches(request_token: Option<&str>, control_token: &str) -> bool {

@@ -315,6 +315,7 @@ mod tests {
                 name: "launcher.exe".to_string(),
                 path: None,
                 match_mode: MatchMode::Path,
+                role: Default::default(),
             });
 
         let issues = validate_config(&config);

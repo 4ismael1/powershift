@@ -159,24 +159,25 @@ native exit waits keep tracking already-known processes.
 
 ## Installation
 
-Download the latest stable installer from GitHub Releases. Current tag: `v1.0.0`.
+Download the latest stable installer from GitHub Releases. Current tag:
+`v1.1.0`.
 
 PowerShift currently targets Windows 10/11 x64 and an administrator Windows
 account. The elevated agent is installed as a SID-scoped scheduled task for the
 account running the installer. Installing from a standard account by entering
-different administrator credentials is not a supported 1.0 scenario; sign in
-to the intended administrator account before installing.
+different administrator credentials is not supported; sign in to the intended
+administrator account before installing.
 
 Recommended release asset:
 
 ```text
-PowerShift_1.0.0_x64-setup.exe
+PowerShift_1.1.0_x64-setup.exe
 ```
 
 The installer contains the UI, agent, tray, and scheduled task setup.
 
-> Note: the initial `v1.0.0` installer is not digitally signed. Windows
-> SmartScreen may show a warning. Verify the SHA-256 published with the release
+> Note: GitHub Release installers are not digitally signed. Windows SmartScreen
+> may show a warning. Verify the SHA-256 published with the exact release asset
 > before running it.
 
 ## Development
@@ -219,7 +220,7 @@ npm.cmd run tauri -- build
 Generated installer:
 
 ```text
-target/release/bundle/nsis/PowerShift_1.0.0_x64-setup.exe
+target/release/bundle/nsis/PowerShift_1.1.0_x64-setup.exe
 ```
 
 ## Release Engineering
@@ -230,8 +231,9 @@ and retains it as a short-lived validation artifact. Stable installers are
 published manually through GitHub Releases together with a SHA-256 checksum.
 Windows SmartScreen may therefore display an unknown-publisher warning.
 
-`v1.0.0` establishes the stable code line. Its distribution and environment
-validation limitations are documented in the release notes and the
+`v1.0.0` established the stable code line. `v1.1.0` is the current
+backward-compatible feature release; its changes and remaining validation are
+documented in the [v1.1.0 release notes](docs/RELEASE_NOTES_1.1.0.md) and the
 [stable release checklist](docs/STABLE_RELEASE_CHECKLIST.md). An in-app updater
 is intentionally deferred until a secure update and rollback design is ready.
 

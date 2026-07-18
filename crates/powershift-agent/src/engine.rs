@@ -1,7 +1,8 @@
 use crate::power_lease::{NoopPowerLeaseJournal, PowerControlLease, PowerLeaseJournal};
 use crate::{AgentActiveProfile, AgentRuntimeState, AgentScanResult, PendingRestoreState};
 use powershift_core::{
-    resolve_active_profiles, ActiveProfile, AppConfig, DetectedProcess, RestoreBehavior,
+    resolve_active_profiles_with_previous, ActiveProfile, AppConfig, DetectedProcess,
+    RestoreBehavior,
 };
 use powershift_windows::{PowerManagerBackend, ProcessSnapshotBackend};
 use std::collections::BTreeSet;
@@ -66,11 +67,32 @@ where
     let active_plan = power_backend
         .active_plan()
         .map_err(|error| error.to_string())?;
-    let active_profiles = resolve_active_profiles(config, processes);
+    let mut previously_active_profile_ids = state.active_profile_ids.clone();
+    if previously_active_profile_ids.is_empty() {
+        if let Some(recovered_winner) = state.winning_profile_id.clone() {
+            previously_active_profile_ids.push(recovered_winner);
+        }
+    }
+    let active_profiles =
+        resolve_active_profiles_with_previous(config, processes, &previously_active_profile_ids);
 
-    if let Some(winner) =
-        choose_winning_profile(&active_profiles, state.winning_profile_id.as_deref())
+    if state
+        .manual_control_profile_id
+        .as_deref()
+        .is_some_and(|profile_id| {
+            !active_profiles
+                .iter()
+                .any(|profile| profile.profile_id == profile_id)
+        })
     {
+        state.manual_control_profile_id = None;
+    }
+
+    if let Some(winner) = choose_winning_profile(
+        &active_profiles,
+        state.winning_profile_id.as_deref(),
+        state.manual_control_profile_id.as_deref(),
+    ) {
         if state.active_profile_ids.is_empty()
             && state.pending_restore.is_none()
             && state.previous_plan_id.is_none()
@@ -127,6 +149,26 @@ where
 
     if let Some(restore) = state.pending_restore.clone() {
         if now_ms >= restore.due_at_ms {
+            if journal
+                .current_lease()
+                .is_some_and(|lease| active_plan.id != lease.managed_plan_id)
+            {
+                journal.clear()?;
+                state.pending_restore = None;
+                state.previous_plan_id = None;
+                return Ok(AgentScanResult {
+                    matched_profile_id: None,
+                    matched_profile_name: None,
+                    target_plan_id: None,
+                    restore_profile_id: None,
+                    restore_profile_name: None,
+                    active_profiles: Vec::new(),
+                    changed_power_plan: false,
+                    restore_scheduled: false,
+                    restored_power_plan: false,
+                });
+            }
+
             let changed_power_plan = active_plan.id != restore.plan_id;
             if changed_power_plan {
                 power_backend
@@ -247,7 +289,17 @@ impl From<&ActiveProfile> for AgentActiveProfile {
 fn choose_winning_profile<'a>(
     active_profiles: &'a [ActiveProfile],
     current_winner_id: Option<&str>,
+    manual_control_profile_id: Option<&str>,
 ) -> Option<&'a ActiveProfile> {
+    if let Some(manual_control_profile_id) = manual_control_profile_id {
+        if let Some(manual) = active_profiles
+            .iter()
+            .find(|profile| profile.profile_id == manual_control_profile_id)
+        {
+            return Some(manual);
+        }
+    }
+
     let max_priority = active_profiles
         .iter()
         .map(|profile| profile.priority)
@@ -451,5 +503,144 @@ mod tests {
         assert_eq!(power.set_calls.borrow().as_slice(), &["balanced"]);
         assert!(journal.current_lease().is_none());
         assert_eq!(journal.clear_calls, 1);
+    }
+
+    #[test]
+    fn pending_restore_preserves_an_external_plan_change() {
+        let recorded = Rc::new(Cell::new(false));
+        let power = OrderedPowerBackend::new("balanced", recorded.clone());
+        let mut journal = RecordingJournal::empty(recorded);
+        let mut state = AgentRuntimeState::default();
+        let config = AppConfig {
+            profiles: vec![profile()],
+            ..AppConfig::default()
+        };
+
+        evaluate_agent_processes_with_journal(
+            &config,
+            &[matching_process()],
+            &power,
+            &mut state,
+            1_000,
+            &mut journal,
+        )
+        .expect("activate profile");
+        let scheduled = evaluate_agent_processes_with_journal(
+            &config,
+            &[],
+            &power,
+            &mut state,
+            2_000,
+            &mut journal,
+        )
+        .expect("schedule restore");
+        assert!(scheduled.restore_scheduled);
+
+        power.active.borrow_mut().id = "power-saver".to_string();
+        let due_at = state
+            .pending_restore
+            .as_ref()
+            .expect("pending restore")
+            .due_at_ms;
+        let result = evaluate_agent_processes_with_journal(
+            &config,
+            &[],
+            &power,
+            &mut state,
+            due_at,
+            &mut journal,
+        )
+        .expect("release after external change");
+
+        assert!(!result.restored_power_plan);
+        assert!(!result.changed_power_plan);
+        assert_eq!(power.active.borrow().id, "power-saver");
+        assert_eq!(power.set_calls.borrow().as_slice(), &["high"]);
+        assert!(journal.current_lease().is_none());
+        assert!(state.pending_restore.is_none());
+        assert!(state.previous_plan_id.is_none());
+    }
+
+    #[test]
+    fn an_edited_controlling_plan_is_reapplied_immediately() {
+        let recorded = Rc::new(Cell::new(false));
+        let power = OrderedPowerBackend::new("balanced", recorded.clone());
+        let mut journal = RecordingJournal::empty(recorded);
+        let mut state = AgentRuntimeState::default();
+        let mut config = AppConfig {
+            profiles: vec![profile()],
+            ..AppConfig::default()
+        };
+
+        evaluate_agent_processes_with_journal(
+            &config,
+            &[matching_process()],
+            &power,
+            &mut state,
+            1_000,
+            &mut journal,
+        )
+        .expect("activate original plan");
+
+        config.profiles[0].power.on_start_plan_id = "ultimate".to_string();
+        let result = evaluate_agent_processes_with_journal(
+            &config,
+            &[matching_process()],
+            &power,
+            &mut state,
+            2_000,
+            &mut journal,
+        )
+        .expect("apply edited plan");
+
+        assert!(result.changed_power_plan);
+        assert_eq!(result.target_plan_id.as_deref(), Some("ultimate"));
+        assert_eq!(power.set_calls.borrow().as_slice(), &["high", "ultimate"]);
+    }
+
+    #[test]
+    fn manual_control_temporarily_overrides_priority_and_expires() {
+        let recorded = Rc::new(Cell::new(false));
+        let power = OrderedPowerBackend::new("balanced", recorded.clone());
+        let mut journal = RecordingJournal::empty(recorded);
+        let mut game = profile();
+        game.power.priority = 90;
+        let mut chrome = Profile::new("chrome", "Chrome", "chrome.exe", "power-saver");
+        chrome.power.priority = 20;
+        let config = AppConfig {
+            profiles: vec![game, chrome],
+            ..AppConfig::default()
+        };
+        let mut state = AgentRuntimeState {
+            manual_control_profile_id: Some("chrome".to_string()),
+            ..AgentRuntimeState::default()
+        };
+        let both = [
+            matching_process(),
+            DetectedProcess::new(43, "chrome.exe", None::<String>),
+        ];
+
+        let promoted = evaluate_agent_processes_with_journal(
+            &config,
+            &both,
+            &power,
+            &mut state,
+            1_000,
+            &mut journal,
+        )
+        .expect("promote active profile");
+        assert_eq!(promoted.matched_profile_id.as_deref(), Some("chrome"));
+
+        let reverted = evaluate_agent_processes_with_journal(
+            &config,
+            &[matching_process()],
+            &power,
+            &mut state,
+            2_000,
+            &mut journal,
+        )
+        .expect("expire promotion");
+        assert_eq!(reverted.matched_profile_id.as_deref(), Some("game"));
+        assert!(state.manual_control_profile_id.is_none());
     }
 }

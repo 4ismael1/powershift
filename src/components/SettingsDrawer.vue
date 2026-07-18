@@ -2,7 +2,7 @@
 import { onMounted, ref } from 'vue';
 import { GitFork, List, Play, RefreshCw, X } from '@lucide/vue';
 import type { AgentStateTone } from '@/services/agentApi';
-import type { AppConfig, AppSettingsUpdate } from '@/services/configApi';
+import type { AppConfig, AppSettingsUpdate, CloseButtonBehavior } from '@/services/configApi';
 
 defineProps<{
   config: AppConfig;
@@ -45,6 +45,12 @@ function trapFocus(event: KeyboardEvent) {
     event.preventDefault();
     first.focus();
   }
+}
+
+function closeButtonBehaviorFromEvent(event: Event): CloseButtonBehavior {
+  const value = (event.target as HTMLSelectElement).value;
+  if (value === 'exit_app' || value === 'ask') return value;
+  return 'hide_window';
 }
 </script>
 
@@ -192,7 +198,7 @@ function trapFocus(event: KeyboardEvent) {
         <select
           :value="config.ui.close_button_behavior"
           :disabled="powerLoading"
-          @change="emit('updateSettings', { closeButtonBehavior: ($event.target as HTMLSelectElement).value })"
+          @change="emit('updateSettings', { closeButtonBehavior: closeButtonBehaviorFromEvent($event) })"
         >
           <option value="hide_window">Cerrar ventana; mantener agente</option>
           <option value="exit_app">Salir por completo</option>

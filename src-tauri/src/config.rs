@@ -229,7 +229,7 @@ pub fn save_app_config(app: AppHandle, config: AppConfig) -> Result<ConfigSaveOu
             sync_running_tray(&app, &config),
         );
         if should_request_agent_rescan(previous.as_ref(), &config) {
-            request_agent_rescan_after_config_save();
+            collect_agent_rescan_warning(warnings, crate::agent_control::wake_agent);
         }
     })
 }
@@ -280,10 +280,11 @@ fn should_request_agent_rescan(previous: Option<&AppConfig>, next: &AppConfig) -
     next.agent.enabled && next.automation.enabled && previous.profiles != next.profiles
 }
 
-fn request_agent_rescan_after_config_save() {
-    std::thread::spawn(|| {
-        let _ = crate::agent_control::wake_agent();
-    });
+fn collect_agent_rescan_warning(
+    warnings: &mut Vec<String>,
+    wake_agent: impl FnOnce() -> Result<(), String>,
+) {
+    collect_sync_warning(warnings, "recarga del agente", wake_agent());
 }
 
 fn sync_tray_autostart(app: &AppHandle, config: &AppConfig) -> Result<(), String> {
@@ -660,14 +661,14 @@ mod tests {
     }
 
     #[test]
-    fn config_save_uses_resilient_agent_wake_path() {
-        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("config.rs");
-        let source = std::fs::read_to_string(source_path).expect("read source");
+    fn config_save_reports_agent_rescan_failures() {
+        let mut warnings = Vec::new();
 
-        assert!(source.contains("request_agent_rescan_after_config_save"));
-        assert!(source.contains("agent_control::wake_agent"));
+        collect_agent_rescan_warning(&mut warnings, || Err("agente no disponible".to_string()));
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("recarga del agente"));
+        assert!(warnings[0].contains("agente no disponible"));
     }
 
     #[test]
